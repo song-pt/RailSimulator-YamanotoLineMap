@@ -17,7 +17,11 @@ else:
 for f in stages:
     t = time.time(); getattr(m, f)(); print(f, round(time.time() - t, 1), flush=True)
 if stages:
-    pickle.dump(m, open(CK, 'wb'), protocol=5); print('checkpoint saved', flush=True)
+    try:
+        pickle.dump(m, open(CK, 'wb'), protocol=5); print('checkpoint saved', flush=True)
+    except Exception as ex:
+        print('checkpoint not saved:', ex, flush=True)
+        if os.path.exists(CK): os.remove(CK)
 for f in ['build_expressways', 'build_catenary', 'build_ground', 'build_buildings']:
     t = time.time(); getattr(m, f)(); print(f, round(time.time() - t, 1), flush=True)
 t = time.time(); rep = validate.check(m); print('validate', round(time.time() - t, 1), flush=True); m.log += rep

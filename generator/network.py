@@ -57,7 +57,7 @@ class Network:
         cxy = np.array([osm.xy(n) for n, _ in chain])
         cum = np.r_[0, np.cumsum(np.hypot(*np.diff(cxy, axis=0).T))]
         wids = [w for _, w in chain]
-        self.main_tags_at = lambda v: osm.ways[wids[min(len(wids) - 1, int(np.searchsorted(cum, v)))]]["tags"]
+        self._chain_cum, self._chain_wids = cum, wids
         self.ms, self.base_h, self.main_cls, self.street, _ = pf.solve(self.main, self.main_tags_at, dem)
         self.main_layer = np.array([parse_layer(self.main_tags_at(v)) for v in self.ms])
         near_main = self.main.buffer(30.0)
@@ -85,6 +85,9 @@ class Network:
             tr.nodes = [n for n in w["nodes"] if n in osm.nodes]
             self.tracks.append(tr)
         self.solve_heights()
+
+    def main_tags_at(self, v):
+        return self.osm.ways[self._chain_wids[min(len(self._chain_wids) - 1, int(np.searchsorted(self._chain_cum, v)))]]["tags"]
 
     def main_layer_at(self, x, y):
         s = np.array([self.main.project(Point(a, b)) for a, b in zip(np.atleast_1d(x), np.atleast_1d(y))])
