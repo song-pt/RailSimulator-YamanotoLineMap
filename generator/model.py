@@ -400,7 +400,7 @@ class Model:
         sv = np.array([self.main.project(Point(a, b)) for a, b in xy])
         k = np.clip(np.searchsorted(net.ms, sv), 0, len(net.ms) - 1)
         near = np.array([self.main.distance(Point(a, b)) < 45.0 for a, b in xy])
-        return net.street[k], near & (net.base_h[k] < net.street[k] - 1.5)
+        return net.street[k], near & (net.base_h[k] < net.street[k] - 0.3)
 
     def wall_strip(self, r, zb, zt, out, mat, thick=0.25):
         """Wall of varying height along points r (N,2), standing on the boundary and extending outward."""
@@ -1239,8 +1239,9 @@ class Model:
         cut_vert = np.zeros(X.size, bool)
         if inU.any():
             pts = np.c_[X.ravel()[inU], Y.ravel()[inU]]
-            cut_vert[np.where(inU)[0][self.street_info(pts)[1]]] = True
             bed = self.idx.nearest_z(pts, r=40.0) - DECK - 0.4
+            # any ground above the bed inside the railway footprint is removed: the boundary wall is the edge there
+            cut_vert[np.where(inU)[0][Z.ravel()[inU] > bed + 0.7]] = True
             Zf = Z.ravel().copy()
             Zf[inU] = np.minimum(Zf[inU], bed)
             Z = Zf.reshape(Z.shape)
