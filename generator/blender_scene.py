@@ -141,6 +141,120 @@ def windows(mat, wall_tex, size, tint, bay=3.2, floor=3.6, glass_frac=(0.62, 0.5
     nt.links.new(mm.outputs[0], bsdf.inputs["Metallic"])
 
 
+def lowrise(mat, pattern, shop=False):
+    """Matte Japanese low/mid-rise facade: per-building colour (vertex attribute) x surface pattern, small sash windows."""
+    nt = mat.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
+    L = nt.links.new
+    uv = nt.nodes.new("ShaderNodeTexCoord")
+    sep = nt.nodes.new("ShaderNodeSeparateXYZ"); L(uv.outputs["UV"], sep.inputs["Vector"])
+    U, V = sep.outputs["X"], sep.outputs["Y"]
+    attr = nt.nodes.new("ShaderNodeAttribute"); attr.attribute_name = "Col"
+
+    def M(op, a, b=None):
+        m = nt.nodes.new("ShaderNodeMath"); m.operation = op
+        for k, x in enumerate((a, b)):
+            if x is None:
+                continue
+            if isinstance(x, (int, float)):
+                m.inputs[k].default_value = x
+            else:
+                L(x, m.inputs[k])
+        return m.outputs[0]
+
+    def mixc(fac, a, b):
+        m = nt.nodes.new("ShaderNodeMix"); m.data_type = "RGBA"
+        L(fac, m.inputs["Factor"])
+        for slot, x in ((6, a), (7, b)):
+            if isinstance(x, tuple):
+                m.inputs[slot].default_value = (*x, 1)
+            else:
+                L(x, m.inputs[slot])
+        return m.outputs[2]
+
+    # surface pattern factor (1 = base colour)
+    if pattern == "tile":   # 45 x 95 mm "nichoukake" tiles with light joints
+        br = nt.nodes.new("ShaderNodeTexBrick")
+        br.inputs["Color1"].default_value = (0.93, 0.93, 0.93, 1); br.inputs["Color2"].default_value = (0.80, 0.80, 0.80, 1)
+        br.inputs["Mortar"].default_value = (1.12, 1.12, 1.12, 1); br.inputs["Scale"].default_value = 1.0
+        br.inputs["Mortar Size"].default_value = 0.006; br.inputs["Brick Width"].default_value = 0.235
+        br.inputs["Row Height"].default_value = 0.068; br.offset = 0.5
+        L(uv.outputs["UV"], br.inputs["Vector"])
+        pat = br.outputs["Color"]
+    elif pattern == "siding":   # fibre-cement siding: horizontal grooves every 455 mm
+        groove = M("LESS_THAN", M("FRACT", M("DIVIDE", V, 0.455)), 0.035)
+        joint = M("LESS_THAN", M("FRACT", M("DIVIDE", U, 3.03)), 0.004)
+        f = M("SUBTRACT", 1.0, M("MULTIPLY", M("MAXIMUM", groove, joint), 0.28))
+        cmb = nt.nodes.new("ShaderNodeCombineXYZ")
+        for k in ("X", "Y", "Z"):
+            L(f, cmb.inputs[k])
+        pat = cmb.outputs["Vector"]
+    else:   # trowelled mortar: luminance of the plaster scan
+        t = nt.nodes.new("ShaderNodeTexImage"); t.image = img("plaster", "diff")
+        mp = nt.nodes.new("ShaderNodeMapping"); mp.inputs["Scale"].default_value = (1 / 3.0, 1 / 3.0, 1)
+        L(uv.outputs["UV"], mp.inputs["Vector"]); L(mp.outputs["Vector"], t.inputs["Vector"])
+        bw = nt.nodes.new("ShaderNodeRGBToBW"); L(t.outputs["Color"], bw.inputs["Color"])
+        mr = nt.nodes.new("ShaderNodeMapRange"); L(bw.outputs["Val"], mr.inputs["Value"])
+        mr.inputs["From Min"].default_value = 0.25; mr.inputs["From Max"].default_value = 0.8
+        mr.inputs["To Min"].default_value = 0.86; mr.inputs["To Max"].default_value = 1.08
+        cmb = nt.nodes.new("ShaderNodeCombineXYZ")
+        for k in ("X", "Y", "Z"):
+            L(mr.outputs["Result"], cmb.inputs[k])
+        pat = cmb.outputs["Vector"]
+    wall = nt.nodes.new("ShaderNodeMix"); wall.data_type = "RGBA"; wall.blend_type = "MULTIPLY"
+    wall.inputs["Factor"].default_value = 1.0
+    L(attr.outputs["Color"], wall.inputs[6]); L(pat, wall.inputs[7])
+    wallc = wall.outputs[2]
+
+    # windows: 3.6 m bays, 2.9 m floors, aluminium sash frame around dark glass
+    fu = M("FRACT", M("DIVIDE", U, 3.6)); fv = M("FRACT", M("DIVIDE", V, 2.9))
+    du = M("ABSOLUTE", M("SUBTRACT", fu, 0.5)); dv = M("ABSOLUTE", M("SUBTRACT", fv, 0.52))
+    inner = M("MULTIPLY", M("LESS_THAN", du, 0.20), M("LESS_THAN", dv, 0.19))
+    outer = M("MULTIPLY", M("LESS_THAN", du, 0.215), M("LESS_THAN", dv, 0.205))
+    floor_ok = M("GREATER_THAN", V, 3.1 if shop else 0.8)
+    inner = M("MULTIPLY", inner, floor_ok); outer = M("MULTIPLY", outer, floor_ok)
+    if shop:   # ground-floor shop front / shutter
+        low = M("MULTIPLY", M("LESS_THAN", V, 2.7), M("GREATER_THAN", V, 0.15))
+        sw = M("LESS_THAN", M("ABSOLUTE", M("SUBTRACT", M("FRACT", M("DIVIDE", U, 5.0)), 0.5)), 0.44)
+        inner = M("MAXIMUM", inner, M("MULTIPLY", low, sw))
+        outer = M("MAXIMUM", outer, M("MULTIPLY", M("MULTIPLY", M("LESS_THAN", V, 2.85), M("GREATER_THAN", V, 0.05)), sw))
+    cell = nt.nodes.new("ShaderNodeCombineXYZ")
+    L(M("FLOOR", M("DIVIDE", U, 3.6)), cell.inputs["X"]); L(M("FLOOR", M("DIVIDE", V, 2.9)), cell.inputs["Y"])
+    wn = nt.nodes.new("ShaderNodeTexWhiteNoise"); wn.noise_dimensions = "3D"; L(cell.outputs["Vector"], wn.inputs["Vector"])
+    ramp = nt.nodes.new("ShaderNodeValToRGB")
+    ramp.color_ramp.elements[0].color = (0.03, 0.035, 0.04, 1); ramp.color_ramp.elements[1].color = (0.14, 0.15, 0.16, 1)
+    L(wn.outputs["Value"], ramp.inputs["Fac"])
+    c1 = mixc(outer, wallc, (0.55, 0.56, 0.57))
+    col = mixc(inner, c1, ramp.outputs["Color"])
+    L(col, bsdf.inputs["Base Color"])
+    rr = nt.nodes.new("ShaderNodeMix"); rr.data_type = "FLOAT"
+    L(inner, rr.inputs["Factor"]); rr.inputs[2].default_value = 0.92; rr.inputs[3].default_value = 0.3
+    L(rr.outputs[0], bsdf.inputs["Roughness"])
+    bsdf.inputs["Metallic"].default_value = 0.0
+    bsdf.inputs["Specular IOR Level"].default_value = 0.25
+
+
+def glass(mat):
+    bsdf = mat.node_tree.nodes["Principled BSDF"]
+    bsdf.inputs["Base Color"].default_value = (0.8, 0.85, 0.85, 1)
+    bsdf.inputs["Roughness"].default_value = 0.05
+    bsdf.inputs["Transmission Weight"].default_value = 0.9
+
+
+def vcol(mat):
+    """Multiply the material's base colour by the per-vertex colour attribute."""
+    nt = mat.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
+    attr = nt.nodes.new("ShaderNodeAttribute"); attr.attribute_name = "Col"
+    mul = nt.nodes.new("ShaderNodeMix"); mul.data_type = "RGBA"; mul.blend_type = "MULTIPLY"; mul.inputs["Factor"].default_value = 1.0
+    if bsdf.inputs["Base Color"].is_linked:
+        nt.links.new(bsdf.inputs["Base Color"].links[0].from_socket, mul.inputs[6])
+    else:
+        mul.inputs[6].default_value = bsdf.inputs["Base Color"].default_value
+    nt.links.new(attr.outputs["Color"], mul.inputs[7])
+    nt.links.new(mul.outputs[2], bsdf.inputs["Base Color"])
+
+
 def make_material(name):
     mat = bpy.data.materials.new(name)
     mat.use_nodes = True
@@ -154,8 +268,14 @@ def make_material(name):
             bsdf.inputs["Emission Strength"].default_value = 0.6
         return mat
     P = {
-        "rail": lambda m: pbr(m, "rust", 0.6, (0.32, 0.26, 0.23), rough=0.8, metal=0.4),
-        "rail_head": lambda m: flat(m, (0.75, 0.75, 0.76), 0.22, 1.0),
+        "rail": lambda m: pbr(m, "rust", 0.6, (0.17, 0.12, 0.10), rough=0.85, metal=0.2),
+        "rail_head": lambda m: flat(m, (0.62, 0.62, 0.63), 0.25, 1.0),
+        "res_tile": lambda m: lowrise(m, "tile"), "res_siding": lambda m: lowrise(m, "siding"),
+        "res_mortar": lambda m: lowrise(m, "mortar"), "res_shop": lambda m: lowrise(m, "mortar", shop=True),
+        "arch_infill": lambda m: (flat(m, (1, 1, 1), 0.45), vcol(m)),
+        "brick_dark": lambda m: pbr(m, "brick", 2.5, (0.7, 0.55, 0.5)),
+        "psd_door": lambda m: flat(m, (0.35, 0.37, 0.4), 0.4, 0.2),
+        "psd_glass": lambda m: glass(m),
         "ballast": lambda m: pbr(m, "ballast", 1.6, (0.62, 0.6, 0.58), normal=1.0),
         "slab_track": lambda m: pbr(m, "concrete", 3.0, (0.75, 0.75, 0.73)),
         "sleeper": lambda m: pbr(m, "sleeper", 1.5, (0.82, 0.8, 0.77)),
@@ -186,7 +306,7 @@ def make_material(name):
         "road_mark": lambda m: flat(m, (0.85, 0.85, 0.85), 0.6),
         "water": lambda m: flat(m, (0.03, 0.06, 0.07), 0.05),
         "ground": lambda m: pbr(m, "pavement", 4.0, (0.7, 0.7, 0.68)),
-        "roof": lambda m: pbr(m, "roof", 5.0, (0.7, 0.7, 0.7)),
+        "roof": lambda m: (pbr(m, "roof", 5.0, (0.95, 0.95, 0.95)), vcol(m)),
         "facade_station_brick": lambda m: windows(m, "brick", 2.5, (1.0, 0.9, 0.85), bay=2.8, floor=4.5, shop=False),
         "facade_glass": lambda m: windows(m, "metal", 3.0, (0.55, 0.6, 0.65), bay=1.6, floor=4.0, glass_frac=(0.85, 0.75), shop=False),
         "facade_office_tile": lambda m: windows(m, "facade_tile", 4.0, (0.9, 0.9, 0.88), bay=3.2, floor=4.0, glass_frac=(0.7, 0.55)),
@@ -214,6 +334,11 @@ for name in meta["materials"]:
     me.polygons.foreach_set("loop_total", np.full(len(F), 3, np.int32))
     uvl = me.uv_layers.new(name="UVMap")
     uvl.data.foreach_set("uv", UV[F.ravel()].ravel())
+    cpath = os.path.join(SCENE, name + ".c.npy")
+    if os.path.exists(cpath):
+        C = np.load(cpath).astype(np.float32)
+        ca = me.color_attributes.new("Col", "FLOAT_COLOR", "POINT")
+        ca.data.foreach_set("color", np.c_[C, np.ones(len(C), np.float32)].ravel())
     me.update(calc_edges=True)
     me.validate(clean_customdata=False)
     ob = bpy.data.objects.new(name, me)
@@ -277,7 +402,15 @@ sc.view_settings.look = "AgX - Medium High Contrast"
 r.image_settings.file_format = "JPEG"; r.image_settings.quality = 92
 sc.render.use_persistent_data = True
 
-if "still" in opt:
+if "look" in opt:
+    for item in str(opt["look"]).split(","):
+        sv, side = item.split(":")
+        eye, rot = pose(float(sv))
+        yaw = rot[2] + math.radians(75 if side == "L" else -75)
+        cam.location = eye + np.array([0, 0, 1.5]); cam.rotation_euler = (math.radians(80), 0, yaw)
+        r.filepath = os.path.join(OUT, "look_%05d_%s.jpg" % (int(float(sv)), side))
+        bpy.ops.render.render(write_still=True)
+elif "still" in opt:
     for v in str(opt["still"]).split(","):
         key(1, float(v))
         sc.frame_set(1)

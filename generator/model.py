@@ -36,6 +36,24 @@ SLAB = 1.1                         # slab thickness of open spans
 DETAIL_DIST = 70.0                 # tracks closer than this to the driven line get sleepers & fastenings
 
 
+PALETTE = [  # (weight, sRGB) - mostly greys/whites, some cream/yellow, few red-orange tile and browns
+    (14, (0.90, 0.90, 0.88)), (12, (0.82, 0.82, 0.80)), (12, (0.72, 0.72, 0.71)), (10, (0.60, 0.60, 0.59)),
+    (8, (0.50, 0.50, 0.50)), (8, (0.88, 0.86, 0.81)), (6, (0.78, 0.76, 0.72)),
+    (6, (0.90, 0.82, 0.62)), (5, (0.85, 0.76, 0.56)), (4, (0.93, 0.87, 0.70)),
+    (4, (0.72, 0.40, 0.27)), (3, (0.64, 0.31, 0.22)), (3, (0.80, 0.50, 0.32)),
+    (3, (0.47, 0.35, 0.27)), (2, (0.36, 0.29, 0.23))]
+
+
+def pick_colour(rng):
+    w = np.array([p[0] for p in PALETTE], float)
+    c = np.array(PALETTE[int(rng.choice(len(PALETTE), p=w / w.sum()))][1])
+    return np.clip(c * rng.uniform(0.94, 1.04) + rng.normal(0, 0.012, 3), 0, 1)
+
+
+def srgb_lin(c):
+    return tuple(float(x) ** 2.2 for x in c)
+
+
 def hsh(s):
     return zlib.crc32(str(s).encode()) & 0xffffffff
 
@@ -299,6 +317,60 @@ class Model:
                 pass
         self.parapet_lines = lines
 
+    def build_arches(self):
+        """Arcade relief on brick viaducts: pilasters, arch rings and infill (shop fronts / bricked bays)."""
+        sc = self.sc
+        BAY = 7.6
+        n_arch = 0
+        for ring in self.parapet_lines:
+            ln = LineString(ring.coords)
+            for d0 in np.arange(BAY / 2, ln.length - BAY / 2, BAY):
+                c = np.array(ln.interpolate(d0).coords[0])
+                a = np.array(ln.interpolate(d0 - 1.0).coords[0]); b = np.array(ln.interpolate(d0 + 1.0).coords[0])
+                tdir = (b - a) / max(1e-9, np.linalg.norm(b - a))
+                # straight enough over the whole bay?
+                e0 = np.array(ln.interpolate(d0 - BAY / 2).coords[0]); e1 = np.array(ln.interpolate(d0 + BAY / 2).coords[0])
+                if np.linalg.norm(e1 - e0) < BAY * 0.97:
+                    continue
+                nrm = np.array([tdir[1], -tdir[0]])
+                if contains_xy(self.U, *(c + nrm * 0.5)):
+                    nrm = -nrm
+                hit = [self.pieces[i] for i in self.piece_tree.query(Point(c).buffer(0.6))]
+                if not any(pc["mode"] == "solid" and pc["mat"] == "brick" and pc["fp"].exterior.distance(Point(c)) < 0.6 for pc in hit):
+                    continue
+                zt = float(self.idx.nearest_z(c[None], r=8.0)[0]) - DECK
+                g = float(self.dem(*c))
+                H = zt - g
+                if H < 4.5:
+                    continue
+                r = 3.0
+                hs = max(1.8, min(H - 0.9 - r, 3.8))
+                ry = min(r, H - 0.9 - hs)
+                if ry < 0.8:
+                    continue
+                ang = np.linspace(0, np.pi, 17)
+                arc = np.c_[np.cos(ang) * r, hs + np.sin(ang) * ry]
+                opening = np.vstack([[[-r, 0.0], [r, 0.0]], arc])           # (u, v) polygon
+                band = np.vstack([np.c_[np.cos(ang) * (r + 0.45), hs + np.sin(ang) * (ry + 0.45)], arc[::-1]])
+                T3 = np.array([tdir[0], tdir[1], 0.0]); N3 = np.array([nrm[0], nrm[1], 0.0])
+                base = np.array([c[0], c[1], g])
+
+                def put(mat, poly, off, col=None):
+                    tri = mk.earcut.triangulate_float64(poly, np.array([len(poly)], np.uint32)).reshape(-1, 3)
+                    V = base + T3 * poly[:, :1] + np.array([0, 0, 1.0]) * poly[:, 1:2] + N3 * off
+                    sc.b(mat).add(V, tri, poly, col)
+
+                rng = np.random.default_rng(hsh((round(c[0]), round(c[1]))))
+                kind = rng.random()
+                col = srgb_lin((0.10, 0.11, 0.12)) if kind < 0.45 else (srgb_lin((0.48, 0.47, 0.45)) if kind < 0.7 else srgb_lin((0.75, 0.62, 0.45)))
+                put("arch_infill", opening, 0.04, col)
+                put("brick_dark", band, 0.08)
+                for side in (-1, 1):
+                    mk.boxes(sc, "brick", [base + T3 * side * BAY / 2 + N3 * 0.15 + [0, 0, (H - 0.4) / 2]], T3, N3, [1.0, 0.3, H - 0.4])
+                mk.boxes(sc, "brick_dark", [base + N3 * 0.12 + [0, 0, H - 0.25]], T3, N3, [BAY, 0.25, 0.3])
+                n_arch += 1
+        self.log.append("brick arches: %d" % n_arch)
+
     def _ring_left(self, path):
         _, left, _ = mk.frames(path)
         return left
@@ -410,6 +482,25 @@ class Model:
         for P in mk.polys(allp):
             if P.area < 40:
                 continue
+            # final safety cut against every track whose envelope overlaps this platform's height band
+            for _ in range(2):
+                zl = self.idx.nearest_z(np.asarray(P.exterior.coords)[:, :2], r=25.0)
+                z_lo, z_hi = float(zl.min()), float(zl.max())
+                cut = []
+                for tr in self.tracks:
+                    if tr.line.distance(P) > 3.0:
+                        continue
+                    near = contains_xy(P.buffer(3.0), tr.pts[:, 0], tr.pts[:, 1])
+                    zq = tr.pts[near, 2] if near.any() else tr.pts[:, 2]
+                    if np.any((zq > z_lo - 7.0) & (zq < z_hi + 6.0)):
+                        cut.append(tr.line.buffer(PLAT_EDGE - 0.001))
+                if cut:
+                    P = P.difference(unary_union(cut))
+                P = max(mk.polys(P), key=lambda q: q.area, default=Polygon())
+                if P.is_empty:
+                    break
+            if P.is_empty or P.area < 40:
+                continue
             c = P.representative_point()
             ti = min(polys, key=lambda pp: pp[0].distance(c))[1]
             self.platforms.append((P, ti))
@@ -479,19 +570,7 @@ class Model:
             mk.sweep(sc, "tactile", ii + [0, 0, 0.006], [(0.80, 0), (1.10, 0)], left=L)
             psd = any(k in tr.name for k in ("山手線", "京浜東北線"))
             if psd and len(ii) > 10:
-                s = mk.cumlen(ii)
-                posts = np.arange(2.0, s[-1] - 2.0, 2.0)
-                base = np.c_[[np.interp(posts, s, ii[:, j]) for j in range(3)]].T + 0 * posts[:, None]
-                Lp = np.c_[[np.interp(posts, s, L[:, j]) for j in range(3)]].T
-                Lp /= np.linalg.norm(Lp, axis=1, keepdims=True) + 1e-9
-                Tp = np.c_[Lp[:, 1], -Lp[:, 0], np.zeros(len(Lp))]
-                pos = base + Lp * 0.42
-                # door panels between posts (lower opaque band + glazing)
-                mk.boxes(sc, "psd_frame", pos + [0, 0, 0.6], Tp, Lp, [1.95, 0.14, 1.2])
-                mk.boxes(sc, "psd_frame", pos + [0, 0, 1.27], Tp, Lp, [1.98, 0.18, 0.14])
-                for q, tq, lq in zip(pos, Tp, Lp):
-                    c4 = [q[:2] + tq[:2] * a * 1.0 + lq[:2] * b * 0.09 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
-                    sc.obstacle(Polygon(c4), q[2], q[2] + 1.35, "psd")
+                self.psd(ii, L)
             # columns along the platform middle, canopy is built per platform polygon below
             s_m = np.arange(6, len(mids) - 6, 12)
             for k in s_m:
@@ -559,6 +638,37 @@ class Model:
                 mk.boxes(sc, "psd_frame", [cc - ax * 5.5 + [0, 0, 0.55]], ax, ay, [0.1, 2.7, 1.1])
                 sc.obstacle(fp, zt, zt + 1.1, "stairs")
 
+    def psd(self, ii, L):
+        """Platform screen doors: 5 m modules = fixed panel (2.9 m) + bi-parting door (2 x 1.0 m)."""
+        sc = self.sc
+        s = mk.cumlen(ii)
+
+        def at(v, off):
+            p = np.c_[[np.interp(v, s, ii[:, j]) for j in range(3)]].T
+            l = np.c_[[np.interp(v, s, L[:, j]) for j in range(3)]].T
+            l /= np.linalg.norm(l, axis=1, keepdims=True) + 1e-9
+            t = np.c_[l[:, 1], -l[:, 0], np.zeros(len(l))]
+            return p + l * off, t, l
+
+        m0 = np.arange(1.5, s[-1] - 6.0, 5.0)
+        if len(m0) == 0:
+            return
+        p, t, l = at(m0 + 1.45, 0.42)                      # fixed panels
+        mk.boxes(sc, "psd_frame", p + [0, 0, 0.45], t, l, [2.9, 0.12, 0.9])
+        mk.boxes(sc, "psd_glass", p + [0, 0, 1.1], t, l, [2.8, 0.04, 0.4])
+        for dx in (0.5, 1.5):                              # door leaves (closed)
+            q, tq, lq = at(m0 + 2.9 + dx, 0.36)
+            mk.boxes(sc, "psd_door", q + [0, 0, 0.62], tq, lq, [0.97, 0.06, 1.24])
+        for dx in (0.0, 2.9, 4.95):                        # posts
+            q, tq, lq = at(m0 + dx, 0.42)
+            mk.boxes(sc, "psd_frame", q + [0, 0, 0.67], tq, lq, [0.12, 0.2, 1.34])
+        q, tq, lq = at(m0 + 1.45, 0.42)
+        mk.boxes(sc, "psd_frame", q + [0, 0, 1.33], tq, lq, [2.95, 0.16, 0.06])
+        pc, tc, lc = at(m0 + 2.5, 0.40)
+        for c, tq, lq in zip(pc, tc, lc):
+            c4 = [c[:2] + tq[:2] * a * 2.5 + lq[:2] * b * 0.11 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            sc.obstacle(Polygon(c4), c[2], c[2] + 1.4, "psd")
+
     def platform_dir(self, P, c):
         hits = sorted(self.idx.near(c[0], c[1], 25.0), key=lambda h: h[1])
         if not hits:
@@ -601,11 +711,48 @@ class Model:
         col_pts = [c for c, _ in self.columns]
         nmast = 0
         for s in np.arange(max(0, s0), min(main.length, s1), SPAN):
-            placed = False
+            need = None
             for ds in (0, 4, -4, 8, -8, 12, -12):
-                if self.gantry(s + ds, supports, col_pts):
-                    placed = True; nmast += 1
+                cov, hit = self.gantry(s + ds, supports, col_pts, need)
+                nmast += bool(cov)
+                rem = (hit if need is None else need) - cov
+                if not rem:
                     break
+                need = rem
+        # second pass: close support gaps longer than 60 m on tracks seen from the driven line
+        region = self.drive_line.buffer(45)
+        near = {}
+        for ti, tr in enumerate(self.tracks):
+            inside = contains_xy(region, tr.pts[:, 0], tr.pts[:, 1])
+            if inside.sum() >= 20:   # at least ~40 m of this track is seen from the driven line
+                sd = mk.cumlen(tr.pts)[inside]
+                near[ti] = (float(sd.min()), float(sd.max()))
+
+        def marks_of(ti):
+            lo, hi = near[ti]
+            ss = sorted(a for a, _ in supports[ti] if lo <= a <= hi)
+            return [lo] + ss + [hi]
+
+        for _ in range(3):
+            for ti in near:
+                tr = self.tracks[ti]
+                marks = marks_of(ti)
+                for a0, a1 in zip(marks[:-1], marks[1:]):
+                    if a1 - a0 <= 60.0:
+                        continue
+                    for frac in ((0.5,) if a1 - a0 < 110 else (1 / 3, 2 / 3)):
+                        sm = main.project(tr.line.interpolate(a0 + (a1 - a0) * frac))
+                        for ds in (0, 4, -4, 8, -8, 12, -12, 16, -16, 20, -20):
+                            if ti in self.gantry(sm + ds, supports, col_pts, need={ti})[0]:
+                                nmast += 1
+                                break
+        gaps = []
+        for ti in near:
+            marks = marks_of(ti)
+            gaps.append(max(b - a for a, b in zip(marks[:-1], marks[1:])))
+        self.supports = supports
+        self.gap_report = sorted(((g, self.tracks[ti].name, self.tracks[ti].wid) for g, ti in zip(gaps, near)), reverse=True)[:8]
+        self.log.append("tracks near drive with a support gap > 65 m: %d of %d" % (sum(g > 65 for g in gaps), len(gaps)))
         # wires
         for ti, tr in enumerate(self.tracks):
             p = tr.pts
@@ -650,11 +797,21 @@ class Model:
                     out[k] = min(out[k], pc["z"] - DECK - SLAB - q[2])
         return out
 
-    def gantry(self, s, supports, col_pts):
+    def soffit(self, x, y, z):
+        """Height (relative to rail z) of the lowest structure soffit above (x,y), or None."""
+        best = None
+        for c in self.piece_tree.query(Point(x, y)):
+            pc = self.pieces[c]
+            if pc["z"] - z > 3.0 and contains_xy(pc["fp"], x, y):
+                h = pc["z"] - DECK - SLAB - z
+                best = h if best is None else min(best, h)
+        return best
+
+    def gantry(self, s, supports, col_pts, need=None):
         sc = self.sc
         main = self.main
         if s < 1 or s > main.length - 1:
-            return False
+            return set(), set()
         P = np.array(main.interpolate(s).coords[0])
         a = np.array(main.interpolate(s - 1).coords[0]); b = np.array(main.interpolate(s + 1).coords[0])
         d = (b - a) / np.linalg.norm(b - a); n = np.array([-d[1], d[0]])
@@ -673,9 +830,38 @@ class Model:
                 continue
             hits.append((t, ti, z, i))
         if not hits:
-            return False
+            return set(), set()
         hits.sort()
-        # dedupe very close hits of the same track
+        hit_set = {h[1] for h in hits}
+        cov = set()
+        zig = 0.2 if (int(s / SPAN) % 2) else -0.2
+        ok_any = False
+
+        def register(t, ti, z, top):
+            x, y = P + n * t
+            supports[ti].append((self.tracks[ti].line.project(Point(x, y)), zig))
+            cov.add(ti)
+            mk.segment_boxes(sc, "mast", [[x, y, top]], [[x, y, z + MESSENGER_H + 0.25]], 0.06, 0.06)
+            mk.segment_boxes(sc, "mast", [[x, y, z + MESSENGER_H + 0.2]], [[x + n[0] * zig, y + n[1] * zig, z + CONTACT_H + 0.05]], 0.035, 0.035)
+            mk.cylinders(sc, "insulator", [[x, y, z + MESSENGER_H + 0.25]], 0.35, 0.07, sides=8)
+
+        # tracks under a low soffit hang their catenary from the structure above
+        rest = []
+        for h in hits:
+            t, ti, z, i = h
+            if need is not None and ti not in need:
+                rest.append(h); continue
+            x, y = P + n * t
+            so = self.soffit(x, y, z)
+            if so is not None and so < BEAM_H + 0.8:
+                if so > MESSENGER_H + 0.5:
+                    register(t, ti, z, z + so)
+                    ok_any = True
+                continue
+            rest.append(h)
+        hits = rest
+        if not hits:
+            return cov, hit_set
         groups, cur = [], [hits[0]]
         for h in hits[1:]:
             prev = cur[-1]
@@ -684,43 +870,43 @@ class Model:
             else:
                 groups.append(cur); cur = [h]
         groups.append(cur)
-        ok_any = False
         for g in groups:
+            if need is not None and not any(h[1] in need for h in g):
+                continue
             ts = [h[0] for h in g]
             zg = float(np.median([h[2] for h in g]))
+            # lower the gantry under an overhanging upper deck (but keep >= 6.55 m: lower chord stays above the 6.2 m messenger)
+            span_fp = LineString([P + n * (ts[0] - 4.5), P + n * (ts[-1] + 4.5)]).buffer(1.0)
+            low = [o[1] for o in self.obstacles_in(span_fp) if o[3] == "slab" and o[1] > zg + 5.5 and o[1] < zg + BEAM_H + 1.0]
+            beam_h = min(BEAM_H, min(low) - zg - 0.5) if low else BEAM_H
+            if beam_h < 6.55:
+                self.why["low_soffit"] = self.why.get("low_soffit", 0) + 1
+                continue
             cand = [ts[0] - 2.5, ts[-1] + 2.5]
-            # intermediate masts in wide gaps (platform middles etc.) to bound the beam span
             for (t1, *_), (t2, *_) in zip(g[:-1], g[1:]):
-                if t2 - t1 > 7.0:
+                if t2 - t1 > 4.8:   # a mast fits between two tracks (>= 2.35 m to each)
                     cand.append((t1 + t2) / 2)
             masts = []
             for t in sorted(cand):
-                okm = None
                 outer = t < ts[0] or t > ts[-1]
-                steps = (0, 0.25, 0.5) if outer else (0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2)
+                steps = (0, 0.25, 0.5, 0.8, 1.1, 1.5) if outer else (0, 0.3, -0.3, 0.6, -0.6, 1.2, -1.2)
                 for dt in steps:
                     tt = t + (dt if not outer else (-dt if t < ts[0] else dt))
                     x, y = P + n * tt
-                    if not self.mast_ok(x, y, zg, col_pts):
-                        continue
-                    okm = tt; break
-                masts.append(okm)
-            if masts[0] is None and masts[-1] is None:
+                    if self.mast_ok(x, y, zg, col_pts, beam_h):
+                        masts.append(tt); break
+            if not masts:
                 self.why["group_fail"] = self.why.get("group_fail", 0) + 1
                 continue
-            if (masts[0] is None or masts[-1] is None) and ts[-1] - ts[0] > 9.0:
-                self.why["one_side"] = self.why.get("one_side", 0) + 1
-                continue  # too wide for a cantilever
-            masts = [m for m in masts if m is not None]
-            if len(masts) == 1:  # cantilever: beam runs from the single mast across the group
-                far = ts[-1] + 0.6 if masts[0] < ts[0] else ts[0] - 0.6
-                masts_beam = sorted([masts[0], far])
-            else:
-                masts_beam = [masts[0], masts[-1]]
-            beam_z = zg + BEAM_H
-            A = P + n * masts_beam[0]; B = P + n * masts_beam[-1]
+            mn, mx = min(masts), max(masts)
+            covered = [h for h in g if mn - 9.0 <= h[0] <= mx + 9.0]
+            if not covered:
+                continue
+            lo = min(mn, min(h[0] for h in covered) - 0.6); hi = max(mx, max(h[0] for h in covered) + 0.6)
+            beam_z = zg + beam_h
+            A = P + n * lo; B = P + n * hi
             beam_fp = LineString([A, B]).buffer(0.3)
-            beam_clear = all(self.clear_of_tracks(*(A + (B - A) * u), beam_z - 0.3, beam_z + 0.45, r=1.95)
+            beam_clear = all(self.clear_of_tracks(*(A + (B - A) * u), beam_z - 0.3, beam_z + 0.45, r=2.3)
                              for u in np.linspace(0, 1, max(2, int(np.hypot(*(B - A)) / 1.0))))
             if not beam_clear or self.blocked(beam_fp, beam_z - 0.4, beam_z + 0.6):
                 self.why["beam_blocked"] = self.why.get("beam_blocked", 0) + 1
@@ -734,18 +920,10 @@ class Model:
             mk.segment_boxes(sc, "mast", [[A[0], A[1], beam_z + 0.2]], [[B[0], B[1], beam_z + 0.2]], 0.25, 0.35)
             mk.segment_boxes(sc, "mast", [[A[0], A[1], beam_z - 0.15]], [[B[0], B[1], beam_z - 0.15]], 0.12, 0.12)
             sc.obstacle(beam_fp, beam_z - 0.25, beam_z + 0.4, "beam")
-            for t, ti, z, i in g:
-                tr = self.tracks[ti]
-                ss = tr.line.project(Point(P + n * t))
-                zig = 0.2 if (int(s / SPAN) % 2) else -0.2
-                supports[ti].append((ss, zig))
-                x, y = P + n * t
-                # drop pipe + registration arm + insulator
-                mk.segment_boxes(sc, "mast", [[x, y, beam_z - 0.2]], [[x, y, z + MESSENGER_H + 0.25]], 0.06, 0.06)
-                mk.segment_boxes(sc, "mast", [[x, y, z + MESSENGER_H + 0.2]], [[x + n[0] * zig, y + n[1] * zig, z + CONTACT_H + 0.05]], 0.035, 0.035)
-                mk.cylinders(sc, "insulator", [[x, y, z + MESSENGER_H + 0.25]], 0.35, 0.07, sides=8)
+            for t, ti, z, i in covered:
+                register(t, ti, z, beam_z - 0.2)
             ok_any = True
-        return ok_any
+        return cov, hit_set
 
     def base_z(self, x, y, zg):
         """Top of whatever structure carries a mast at (x,y): platform, deck or ground."""
@@ -754,20 +932,26 @@ class Model:
             return pz
         return zg - DECK
 
-    def mast_ok(self, x, y, zg, col_pts):
+    def mast_ok(self, x, y, zg, col_pts, beam_h=BEAM_H):
         why = self.why = getattr(self, "why", {})
         if not hasattr(self, "_U_in"):
             self._U_in = self.U.buffer(-0.35)
-        if not self.clear_of_tracks(x, y, zg - DECK, zg + BEAM_H, r=2.35):
+        if not self.clear_of_tracks(x, y, zg - DECK, zg + beam_h, r=2.35):
             why["track"] = why.get("track", 0) + 1; return False
         if not contains_xy(self._U_in, x, y):
             why["no_deck"] = why.get("no_deck", 0) + 1; return False  # must stand on deck / platform
         for c in col_pts:
             if abs(c[0] - x) < 1.2 and abs(c[1] - y) < 1.2:
                 why["column"] = why.get("column", 0) + 1; return False
-        if self.blocked(Point(x, y).buffer(0.25), zg - DECK + 0.3, zg + BEAM_H, skip=("slab", "platform")):
+        if self.blocked(Point(x, y).buffer(0.25), zg - DECK + 0.3, zg + beam_h + 0.4, skip=("platform",)):
             why["obstacle"] = why.get("obstacle", 0) + 1; return False
         return True
+
+    def obstacles_in(self, fp):
+        self.blocked(fp, 0, 0)   # refreshes the index
+        obs = self.sc.obstacles
+        out = [obs[c] for c in self._otree.query(fp, predicate="intersects")]
+        return out + [obs[i] for i in range(self._otree_n, len(obs)) if obs[i][0].intersects(fp)]
 
     def blocked(self, fp, z0, z1, skip=()):
         obs = self.sc.obstacles
@@ -942,25 +1126,36 @@ class Model:
             for q in mk.polys(rest):
                 if q.area < 25:
                     continue
-                mk.prism(sc, "roof", facade, segmentize(q, 6.0), top, b["zmin"] - 0.5, side_v0=b["zmin"])
+                mk.prism(sc, "roof", facade[0], segmentize(q, 6.0), top, b["zmin"] - 0.5, side_v0=b["zmin"],
+                         col_top=facade[2], col_side=facade[1])
                 sc.obstacle(q, b["zmin"], top, "building")
             nc += 1
         self.log.append("buildings kept %d, clipped %d, dropped %d" % (nk, nc, nd))
 
     def facade_for(self, b):
+        """(wall material, wall colour, roof colour). Below 25 m: matte Japanese low-rise styles with per-building colour."""
         h = b["zmax"] - b["zmin"]
         name = b.get("name") or ""
         c = b["footprint"].mean(0)
+        rng = np.random.default_rng(hsh(b["id"]))
+        grey = float(rng.uniform(0.42, 0.75))
+        roof = srgb_lin((grey, grey, grey * 0.98))
         if "東京駅" in name and c[0] < -40:
-            return "facade_station_brick"
+            return "facade_station_brick", (1.0, 1.0, 1.0), roof
         r = hsh(b["id"]) % 100
         if h > 60:
-            return ["facade_glass", "facade_glass", "facade_office_tile"][r % 3]
+            return ["facade_glass", "facade_glass", "facade_office_tile"][r % 3], (1.0, 1.0, 1.0), roof
         if h > 25:
-            return ["facade_office_tile", "facade_rect", "facade_glass", "facade_plaster_win"][r % 4]
-        return ["facade_plaster_win", "facade_beige_win", "facade_rect", "facade_shop"][r % 4]
+            return ["facade_office_tile", "facade_rect", "facade_glass", "facade_office_tile"][r % 4], (1.0, 1.0, 1.0), roof
+        col = srgb_lin(pick_colour(rng))
+        if h <= 12:
+            kinds = ["res_siding", "res_siding", "res_mortar", "res_tile", "res_shop"]
+        else:
+            kinds = ["res_tile", "res_tile", "res_mortar", "res_shop"]
+        return kinds[int(rng.integers(len(kinds)))], col, roof
 
-    def emit_lod2(self, b, facade):
+    def emit_lod2(self, b, style):
+        facade, wall_col, roof_col = style
         sc = self.sc
         z0 = b["zmin"]
         for kind, ring in b["surfaces"]:
@@ -991,11 +1186,11 @@ class Model:
             if is_wall:
                 hd = np.array([-nrm[1], nrm[0], 0.0]); hd /= np.linalg.norm(hd) + 1e-9
                 uv = np.c_[r @ hd, r[:, 2] - z0]
-                mat = facade
+                mat, col = facade, wall_col
             else:
                 uv = r[:, :2]
-                mat = "roof"
-            sc.b(mat).add(r, tri, uv)
+                mat, col = "roof", roof_col
+            sc.b(mat).add(r, tri, uv, col)
         fp = Polygon(b["footprint"]).buffer(0)
         sc.obstacle(fp, b["zmin"], b["zmax"], "building")
 
@@ -1007,6 +1202,7 @@ class Model:
         self.platform_meshes()
         self.platform_furniture()
         self.build_parapets()
+        self.build_arches()
         self.build_expressways()
         self.build_catenary()
         self.build_ground()
@@ -1027,7 +1223,8 @@ class Model:
             a = bk.arrays()
             if a is None:
                 continue
-            v, f, uv = a
+            v, f, uv, col = a
+            np.save(os.path.join(out, mat + ".c.npy"), col.astype(np.float32))
             np.save(os.path.join(out, mat + ".v.npy"), v.astype(np.float32))
             np.save(os.path.join(out, mat + ".f.npy"), f.astype(np.int32))
             np.save(os.path.join(out, mat + ".uv.npy"), uv.astype(np.float32))

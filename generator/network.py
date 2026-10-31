@@ -16,6 +16,8 @@ RAIL_ABOVE_GROUND = 7.6
 LAYER_OFFSET = {1: 0.0, 2: 8.4, 3: 16.8, 4: 11.0}
 GOOD_LAYER_LEN = 80.0
 SMOOTH = 6.0
+# lines that run on the same structure as the Yamanote line around the loop (shared viaducts / island platforms)
+PAIRED_LINES = ("山手線", "京浜東北線")
 
 
 def resample(line, step):
@@ -92,7 +94,8 @@ class Network:
             for n in tr.nodes:
                 i = idx[n]
                 wn = w
-                if not tr.main and max(1, layer) == 1 and self.main.distance(Point(xy[i])) < 6.5:
+                paired = any(k in tr.name for k in PAIRED_LINES) and self.main.distance(Point(xy[i])) < 20.0
+                if not tr.main and max(1, layer) == 1 and (paired or self.main.distance(Point(xy[i])) < 6.5):
                     wn = 1e3   # tracks running alongside the main line share its structure level
                 target[i] += wn * (base[i] + off); wsum[i] += wn
             for a, b in zip(tr.nodes[:-1], tr.nodes[1:]):

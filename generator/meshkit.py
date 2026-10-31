@@ -10,16 +10,17 @@ from shapely.geometry import Polygon, MultiPolygon
 
 class Bucket:
     def __init__(self):
-        self.v, self.f, self.uv = [], [], []   # verts (n,3), faces (m,k) indices, uv per vertex (n,2)
+        self.v, self.f, self.uv, self.c = [], [], [], []   # verts, faces, uv per vertex, linear rgb per vertex
         self.n = 0
 
-    def add(self, verts, faces, uvs):
+    def add(self, verts, faces, uvs, col=None):
         verts = np.asarray(verts, np.float64).reshape(-1, 3)
         uvs = np.asarray(uvs, np.float64).reshape(-1, 2)
         faces = np.asarray(faces, np.int64)
         if len(verts) == 0 or len(faces) == 0:
             return
         self.v.append(verts); self.uv.append(uvs); self.f.append(faces + self.n)
+        self.c.append(np.broadcast_to(np.asarray(col if col is not None else (1.0, 1.0, 1.0), np.float32), (len(verts), 3)))
         self.n += len(verts)
 
     def arrays(self):
@@ -31,7 +32,7 @@ class Bucket:
                 tris.append(f)
             else:  # quads -> two triangles
                 tris.append(f[:, [0, 1, 2]]); tris.append(f[:, [0, 2, 3]])
-        return np.concatenate(self.v), np.concatenate(tris), np.concatenate(self.uv)
+        return np.concatenate(self.v), np.concatenate(tris), np.concatenate(self.uv), np.concatenate(self.c)
 
 
 class Scene:
@@ -209,7 +210,7 @@ def densify(poly, step):
     return segmentize(poly, step)
 
 
-def prism(sc, top_mat, side_mat, poly, ztop, zbot, bottom=False, side_v0=None, top_only=False):
+def prism(sc, top_mat, side_mat, poly, ztop, zbot, bottom=False, side_v0=None, top_only=False, col_top=None, col_side=None):
     """Extrude polygon. ztop/zbot: float or callable(xy (n,2))->z (n,)."""
     for p in polys(poly):
         if p.area < 0.01:
@@ -223,7 +224,7 @@ def prism(sc, top_mat, side_mat, poly, ztop, zbot, bottom=False, side_v0=None, t
                 a, b, c = pts[tri[:, 0]], pts[tri[:, 1]], pts[tri[:, 2]]
                 cross = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
                 tri = np.where(cross[:, None] < 0, tri[:, ::-1], tri)
-                sc.b(top_mat).add(np.c_[pts, zt], tri, pts)
+                sc.b(top_mat).add(np.c_[pts, zt], tri, pts, col_top)
                 if bottom:
                     zb = zbot(pts) if callable(zbot) else np.full(len(pts), zbot)
                     sc.b(side_mat).add(np.c_[pts, zb], tri[:, ::-1], pts)
@@ -244,4 +245,4 @@ def prism(sc, top_mat, side_mat, poly, ztop, zbot, bottom=False, side_v0=None, t
                 s = cumlen(np.c_[r[:, :2], np.zeros(n)])
                 v0 = zb_r if side_v0 is None else np.full(n, side_v0)
                 uv = np.concatenate([np.c_[s, zb_r - v0], np.c_[s, zt_r - v0]])
-                sc.b(side_mat).add(V, F, uv)
+                sc.b(side_mat).add(V, F, uv, col_side)
