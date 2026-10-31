@@ -303,6 +303,7 @@ def make_material(name):
         "res_mortar": lambda m: lowrise(m, "mortar"), "res_shop": lambda m: lowrise(m, "mortar", shop=True),
         "arch_infill": lambda m: (flat(m, (1, 1, 1), 0.45), vcol(m)),
         "brick_dark": lambda m: pbr(m, "brick", 2.5, (0.7, 0.55, 0.5)),
+        "retaining": lambda m: pbr(m, "concrete", 2.2, (0.66, 0.65, 0.62)),
         "psd_door": lambda m: flat(m, (0.35, 0.37, 0.4), 0.4, 0.2),
         "psd_glass": lambda m: glass(m),
         "ballast": lambda m: pbr(m, "ballast", 1.6, (0.62, 0.6, 0.58), normal=1.0),
@@ -351,7 +352,14 @@ def make_material(name):
 # ---------------------------------------------------------------- geometry
 bpy.ops.wm.read_factory_settings(use_empty=True)
 sc = bpy.context.scene
-for name in meta["materials"]:
+cam_pts0 = np.array(meta["camera"]); cam_s0 = np.array(meta["cam_s"])
+first = str(opt.get("still", opt.get("look", "0"))).split(",")[0].split(":")[0]
+focus = np.array([np.interp(float(first), cam_s0, cam_pts0[:, j]) for j in range(2)])
+RADIUS = float(opt.get("radius", 1600))
+entries = [(t[0], t[1]) for t in meta["tiles"] if np.hypot(t[2] - focus[0], t[3] - focus[1]) < RADIUS + 710] \
+    if "tiles" in meta else [(m, m) for m in meta["materials"]]
+mats = {}
+for name, matname in entries:
     V = np.load(os.path.join(SCENE, name + ".v.npy")).astype(np.float32)
     F = np.load(os.path.join(SCENE, name + ".f.npy")).astype(np.int32)
     UV = np.load(os.path.join(SCENE, name + ".uv.npy")).astype(np.float32)
@@ -377,7 +385,9 @@ for name in meta["materials"]:
     me.validate(clean_customdata=False)
     ob = bpy.data.objects.new(name, me)
     sc.collection.objects.link(ob)
-    me.materials.append(make_material(name))
+    if matname not in mats:
+        mats[matname] = make_material(matname)
+    me.materials.append(mats[matname])
 
 # ---------------------------------------------------------------- world, light, camera
 world = bpy.data.worlds.new("w"); sc.world = world; world.use_nodes = True

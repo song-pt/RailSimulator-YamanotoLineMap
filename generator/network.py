@@ -20,6 +20,14 @@ SMOOTH = 6.0
 PAIRED_LINES = ("山手線", "京浜東北線")
 
 
+def parse_layer(tags):
+    v = str(tags.get("layer", "0") or "0").split(";")[0].strip()
+    try:
+        return int(float(v))
+    except ValueError:
+        return 0
+
+
 def resample(line, step):
     n = max(2, int(np.ceil(line.length / step)) + 1)
     return np.array([line.interpolate(t, normalized=True).coords[0] for t in np.linspace(0, 1, n)])
@@ -44,21 +52,29 @@ class Network:
         s0, s1 = s_range
         from shapely.ops import substring
         self.zone = substring(self.main, max(0, s0), min(self.main.length, s1)).buffer(corridor)
-        # smoothed reference profile along the main line
-        self.ms = np.arange(0, self.main.length, 2.0)
-        mxy = np.array([self.main.interpolate(s).coords[0] for s in self.ms])
-        g = dem(mxy[:, 0], mxy[:, 1])
-        k = np.exp(-0.5 * (np.arange(-150, 151) / 60.0) ** 2); k /= k.sum()
-        gs = np.convolve(np.pad(g, 150, mode="edge"), k, mode="valid")
-        self.base_h = gs + RAIL_ABOVE_GROUND
+        # structure-aware reference profile along the main line (see profile.py)
+        import profile as pf
+        cxy = np.array([osm.xy(n) for n, _ in chain])
+        cum = np.r_[0, np.cumsum(np.hypot(*np.diff(cxy, axis=0).T))]
+        wids = [w for _, w in chain]
+        self.main_tags_at = lambda v: osm.ways[wids[min(len(wids) - 1, int(np.searchsorted(cum, v)))]]["tags"]
+        self.ms, self.base_h, self.main_cls, self.street, _ = pf.solve(self.main, self.main_tags_at, dem)
+        self.main_layer = np.array([parse_layer(self.main_tags_at(v)) for v in self.ms])
+        near_main = self.main.buffer(30.0)
         self.tracks = []
         for wid, w in osm.ways.items():
             t = w["tags"]
-            if t.get("railway") != "rail" or t.get("tunnel") or str(t.get("layer", "1")).startswith("-"):
+            if t.get("railway") != "rail":
                 continue
-            if t.get("service") in ("yard", "siding") and "新幹線" not in t.get("name", ""):
-                pass
+            layer = parse_layer(t)
+            below = t.get("tunnel") or layer < 0
             xy = osm.way_xy(wid)
+            if len(xy) < 2:
+                continue
+            if below and wid not in self.main_ways:
+                # cuttings / covered sections: only shallow tracks running with the main line
+                if layer < -1 or not LineString(xy).within(near_main.buffer(5.0)):
+                    continue
             if len(xy) < 2:
                 continue
             ln = LineString(xy)
@@ -69,6 +85,10 @@ class Network:
             tr.nodes = [n for n in w["nodes"] if n in osm.nodes]
             self.tracks.append(tr)
         self.solve_heights()
+
+    def main_layer_at(self, x, y):
+        s = np.array([self.main.project(Point(a, b)) for a, b in zip(np.atleast_1d(x), np.atleast_1d(y))])
+        return self.main_layer[np.clip(np.searchsorted(self.ms, s), 0, len(self.ms) - 1)]
 
     def base(self, x, y):
         s = np.array([self.main.project(Point(a, b)) for a, b in zip(np.atleast_1d(x), np.atleast_1d(y))])
@@ -82,20 +102,22 @@ class Network:
         N = len(idx)
         xy = np.array([self.osm.xy(n) for n in idx])
         base = self.base(xy[:, 0], xy[:, 1])
+        mlay = self.main_layer_at(xy[:, 0], xy[:, 1])
         target = np.zeros(N); wsum = np.zeros(N)
         rows, cols, vals = [], [], []
         for tr in self.tracks:
             L = tr.line.length
-            layer = int(tr.tags.get("layer", "1") or 1)
-            off = LAYER_OFFSET.get(max(1, layer), 0.0)
+            layer = parse_layer(tr.tags)
             w = 1.0 if L >= GOOD_LAYER_LEN else 0.0
             if tr.main:
                 off, w = 0.0, 1e4
             for n in tr.nodes:
                 i = idx[n]
                 wn = w
+                # offset relative to the main line's own layer here (main is layer 1 on viaducts, -1 in cuttings ...)
+                off = 0.0 if tr.main else LAYER_OFFSET.get(int(np.clip(layer - mlay[i] + 1, 1, 4)), 0.0)
                 paired = any(k in tr.name for k in PAIRED_LINES) and self.main.distance(Point(xy[i])) < 20.0
-                if not tr.main and max(1, layer) == 1 and (paired or self.main.distance(Point(xy[i])) < 6.5):
+                if not tr.main and layer <= mlay[i] and (paired or self.main.distance(Point(xy[i])) < 6.5):
                     wn = 1e3   # tracks running alongside the main line share its structure level
                 target[i] += wn * (base[i] + off); wsum[i] += wn
             for a, b in zip(tr.nodes[:-1], tr.nodes[1:]):

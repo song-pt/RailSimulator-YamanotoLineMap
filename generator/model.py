@@ -33,7 +33,8 @@ MESSENGER_H = 6.20
 BEAM_H = 7.30
 SPAN = 45.0
 SLAB = 1.1                         # slab thickness of open spans
-DETAIL_DIST = 70.0                 # tracks closer than this to the driven line get sleepers & fastenings
+DETAIL_DIST = 25.0                 # tracks closer than this to the driven line get sleepers
+BRICK_ZONE = (-1000.0, -2000.0, 800.0, 2000.0)   # Shimbashi - Akihabara brick arch viaducts (local x0, y0, x1, y1)
 
 
 PALETTE = [  # (weight, sRGB) - mostly greys/whites, some cream/yellow, few red-orange tile and browns
@@ -52,6 +53,19 @@ def pick_colour(rng):
 
 def srgb_lin(c):
     return tuple(float(x) ** 2.2 for x in c)
+
+
+def runs(mask):
+    """Index arrays of consecutive True runs (each run extended by one point to close gaps)."""
+    out, cur = [], []
+    for i, v in enumerate(mask):
+        if v:
+            cur.append(i)
+        elif cur:
+            cur.append(i); out.append(np.array(cur)); cur = []
+    if cur:
+        out.append(np.array(cur))
+    return out
 
 
 def hsh(s):
@@ -106,11 +120,14 @@ class TrackIdx:
 
 
 class Model:
-    def __init__(self, data, s_range=(250, 3650), drive=(650, 3250)):
+    def __init__(self, data, s_range=None, drive=None):
         self.data = data
         self.osm = OSM(os.path.join(data, "osm.json"))
-        self.dem = DEM(139.756, 35.672, 139.784, 35.706, os.path.join(data, "dem"))
-        self.net = Network(self.osm, self.dem, 1972960, s_range)
+        ext = os.path.join(data, "extent.json")
+        bbox = json.load(open(ext))["bbox"] if os.path.exists(ext) else (139.756, 35.672, 139.784, 35.706)
+        self.dem = DEM(*bbox, os.path.join(data, "dem"))
+        self.net = Network(self.osm, self.dem, 1972960, s_range or (0, 1e9))
+        drive = drive or (0.0, self.net.main.length)
         self.tracks = self.net.tracks
         self.idx = TrackIdx(self.tracks)
         self.sc = mk.Scene()
@@ -209,6 +226,8 @@ class Model:
                 else:
                     cz = c + [0, 0, SLEEPER_TOP - SLEEPER_H / 2]
                     mk.boxes(sc, "sleeper", cz, tt, ll, [0.24, 2.0, SLEEPER_H])
+                    if not (tr.main or any(k in tr.name for k in ("山手線", "京浜東北線"))):
+                        continue
                     for side in (-1, 1):
                         for off in (-0.11, 0.11):
                             mk.boxes(sc, "fastening", c + ll * (side * RAIL_HALF + off) + [0, 0, SLEEPER_TOP + 0.02], tt, ll,
@@ -236,19 +255,38 @@ class Model:
                     cut = unary_union([self.tracks[t2].line.buffer(2.25) for t2, _, _ in low])
                     fp = fp.difference(cut)
                     mode = "over"
-                elif tr.bridge:
+                elif tr.bridge and zc - float(self.dem(*mid[:2])) > 4.0:
                     mode = "girder"
                 else:
                     mode = "solid"
                 if fp.is_empty or fp.area < 1.0:
                     continue
-                pieces.append(dict(ti=ti, fp=fp, sub=sub, mode=mode, z=zc, low=[t2 for t2, _, _ in low],
-                                   mat="brick" if (any(b in tr.name for b in brick_lines) and mode == "solid") else "concrete"))
+                rel = zc - float(self.dem(*mid[:2]))
+                x0, y0, x1, y1 = BRICK_ZONE
+                brick = (mode == "solid" and rel > 4.5 and any(b in tr.name for b in brick_lines)
+                         and x0 < mid[0] < x1 and y0 < mid[1] < y1)
+                mat = "brick" if brick else ("concrete" if rel > 4.5 else "retaining")
+                pieces.append(dict(ti=ti, fp=fp, sub=sub, mode=mode, z=zc, low=[t2 for t2, _, _ in low], mat=mat,
+                                   covered=bool(tr.tags.get("tunnel"))))
         self.pieces = pieces
         self.deck_union = unary_union([pc["fp"] for pc in pieces])
-        self.piece_tree = STRtree([pc["fp"] for pc in pieces])
+        # covered sections: roof slab over the track bed (soffit 7.2 m above rail), walls come from the boundary pass
+        roofs = []
+        for pc in pieces:
+            if not pc["covered"]:
+                continue
+            fp = pc["fp"].buffer(0.4)
+            z0 = pc["z"] + 7.2
+            g = float(self.dem(*pc["sub"][len(pc["sub"]) // 2][:2]))
+            mk.prism(sc, "concrete", "concrete", segmentize(fp, 3.0), max(z0 + 1.0, g), z0, bottom=True)
+            sc.obstacle(fp, z0, max(z0 + 1.0, g), "slab")
+            roofs.append(dict(ti=-1, fp=fp, sub=pc["sub"], mode="roof", z=z0 + DECK + SLAB, low=[], mat="concrete", covered=True))
+        self.pieces = pieces + roofs
+        self.piece_tree = STRtree([pc["fp"] for pc in self.pieces])
 
         for pc in pieces:
+            if pc["mode"] == "roof":
+                continue
             sub = pc["sub"]
             line = LineString(sub[:, :2])
             sd = mk.cumlen(sub)
@@ -259,7 +297,7 @@ class Model:
 
             fp = segmentize(pc["fp"], 2.5)
             if pc["mode"] == "solid":
-                zb = lambda xy: self.dem(xy[:, 0], xy[:, 1]) - 0.4
+                zb = lambda xy, zt=ztop: np.minimum(self.dem(xy[:, 0], xy[:, 1]) - 0.4, zt(xy) - 0.6)
                 mk.prism(sc, "deck_top", pc["mat"], fp, ztop, zb)
             else:
                 zb = lambda xy, zt=ztop: zt(xy) - SLAB
@@ -290,32 +328,53 @@ class Model:
                 break
 
     def build_parapets(self):
+        from shapely.geometry.polygon import orient
         sc = self.sc
         U = unary_union([self.deck_union] + [p for p, _ in self.platforms])
         U = U.buffer(0.05).buffer(-0.05)
         self.U = U
         lines = []
+        plat_union = unary_union([p for p, _ in self.platforms]) if self.platforms else Polygon()
+        n_ret = 0
         for poly in mk.polys(U):
+            poly = orient(poly, 1.0)       # interior on the left of every ring
             for ring in [poly.exterior] + list(poly.interiors):
                 if ring.length < 6:
                     continue
                 lines.append(ring)
-        plat_union = unary_union([p for p, _ in self.platforms]) if self.platforms else Polygon()
-        for ring in lines:
-            r = np.asarray(segmentize(LineString(ring.coords), 2.0).coords)
-            if len(r) < 3:
-                continue
-            # pull the wall 0.15 m inside the deck
-            c = LineString(r).offset_curve(0.0)
-            z = self.idx.nearest_z(r[:, :2]) - DECK
-            onplat = np.array([plat_union.distance(Point(a, b)) < 0.4 for a, b in r[:, :2]])
-            pz = np.array([self.plat_top_at(a, b) for a, b in r[:, :2]])
-            z = np.where(onplat & ~np.isnan(pz), pz, z)
-            path = np.c_[r[:, :2], z]
-            mk.sweep(sc, "parapet", path, [(-0.1, 0), (-0.1, 1.05), (0.1, 1.05), (0.1, 0)], left=self._ring_left(path))
-            for a, b in zip(path[:-1], path[1:]):
-                pass
+                r = np.asarray(segmentize(LineString(ring.coords), 2.0).coords)
+                if len(r) < 3:
+                    continue
+                t = np.gradient(r, axis=0); t /= np.linalg.norm(t, axis=1, keepdims=True) + 1e-9
+                out = np.c_[t[:, 1], -t[:, 0]]                     # right of travel = outside
+                z = self.idx.nearest_z(r) - DECK
+                onplat = np.array([plat_union.distance(Point(a, b)) < 0.4 for a, b in r])
+                pz = np.array([self.plat_top_at(a, b) for a, b in r])
+                base = np.where(onplat & ~np.isnan(pz), pz, z)
+                g_out = self.dem(*(r + out * 1.5).T)
+                cut = g_out > base + 0.8
+                top = np.where(cut, g_out + 1.1, base + 1.05)
+                for m, mat in ((cut, "retaining"), (~cut, "parapet")):
+                    for run in runs(m):
+                        if len(run) < 2:
+                            continue
+                        self.wall_strip(r[run], base[run] - (0.2 if mat == "retaining" else 0.0), top[run], out[run], mat)
+                        n_ret += mat == "retaining"
         self.parapet_lines = lines
+        self.log.append("boundary wall runs: %d retaining" % n_ret)
+
+    def wall_strip(self, r, zb, zt, out, mat, thick=0.25):
+        """Wall of varying height along points r (N,2), standing on the boundary and extending outward."""
+        n = len(r)
+        inner = r; outer = r + out * thick
+        V = np.concatenate([np.c_[inner, zb], np.c_[inner, zt], np.c_[outer, zt], np.c_[outer, zb]])
+        i = np.arange(n - 1)
+        F = np.concatenate([np.stack([i, i + 1, i + 1 + n, i + n], 1),                  # inner face
+                            np.stack([i + n, i + 1 + n, i + 1 + 2 * n, i + 2 * n], 1),  # top
+                            np.stack([i + 2 * n, i + 1 + 2 * n, i + 1 + 3 * n, i + 3 * n], 1)])  # outer face
+        sd = mk.cumlen(np.c_[r, np.zeros(n)])
+        uv = np.concatenate([np.c_[sd, zb], np.c_[sd, zt], np.c_[sd, zt + thick], np.c_[sd, zb]])
+        self.sc.b(mat).add(V, F, uv)
 
     def build_arches(self):
         """Arcade relief on brick viaducts: pilasters, arch rings and infill (shop fronts / bricked bays)."""
@@ -978,6 +1037,52 @@ class Model:
                 return True
         return False
 
+    def build_overpasses(self):
+        sc = self.sc
+        widths = {"trunk": 10.0, "primary": 9.0, "secondary": 7.5, "tertiary": 6.0, "residential": 3.5, "unclassified": 3.5,
+                  "living_street": 3.0, "service": 2.5, "pedestrian": 2.5, "footway": 1.5, "cycleway": 1.5}
+        n = 0
+        for wid, w in self.osm.ways.items():
+            t = w["tags"]
+            hw = t.get("highway")
+            if hw not in widths or not t.get("bridge") or t.get("tunnel"):
+                continue
+            xy = self.osm.way_xy(wid)
+            if len(xy) < 2:
+                continue
+            line = LineString(xy)
+            if not line.intersects(self.U):
+                continue
+            p = np.asarray(segmentize(line, 2.0).coords)
+            g = self.dem(p[:, 0], p[:, 1])
+            zend = np.interp(mk.cumlen(np.c_[p, g]), [0, mk.cumlen(np.c_[p, g])[-1]], [g[0], g[-1]])
+            need = np.full(len(p), -1e9)
+            for k, (x, y) in enumerate(p):
+                for ti, d, zr in self.idx.near(x, y, widths[hw] + 2.5):
+                    need[k] = max(need[k], zr + 7.6 + 1.0)
+            z = np.maximum(zend, need)
+            seg = np.r_[0, np.hypot(*np.diff(p, axis=0).T)]
+            for _ in range(2):
+                for k in range(1, len(z)):
+                    z[k] = max(z[k], z[k - 1] - 0.06 * seg[k])
+                for k in range(len(z) - 2, -1, -1):
+                    z[k] = max(z[k], z[k + 1] - 0.06 * seg[k + 1])
+            path = np.c_[p, z]
+            hwid = widths[hw]
+            mk.sweep(sc, "asphalt" if hw not in ("footway", "pedestrian", "cycleway") else "sidewalk", path, [(-hwid, 0), (hwid, 0)])
+            mk.sweep(sc, "concrete", path, [(hwid, 0), (hwid, -1.0), (-hwid, -1.0), (-hwid, 0)])
+            for sgn in (-1, 1):
+                mk.sweep(sc, "parapet", path, [(sgn * hwid, 0), (sgn * hwid, 1.1), (sgn * (hwid - 0.2), 1.1), (sgn * (hwid - 0.2), 0)])
+            for k in range(len(p) - 1):
+                fp = LineString(p[k:k + 2]).buffer(hwid, cap_style="flat")
+                sc.obstacle(fp, float(min(z[k], z[k + 1])) - 1.0, float(max(z[k], z[k + 1])) + 1.1, "overpass")
+            fp_all = LineString(p).buffer(hwid)
+            self.pieces.append(dict(ti=-1, fp=fp_all, sub=path, mode="roof", z=float(z.min()) - 1.0 + DECK + SLAB, low=[],
+                                    mat="concrete", covered=False))
+            n += 1
+        self.piece_tree = STRtree([pc["fp"] for pc in self.pieces])
+        self.log.append("overpasses: %d" % n)
+
     # ------------------------------------------------------------------ expressways
     def build_expressways(self):
         sc = self.sc
@@ -1038,6 +1143,13 @@ class Model:
             inside = contains_xy(W.buffer(4.0), X.ravel(), Y.ravel()).reshape(X.shape)
             Z = np.where(inside, -1.5, Z)
         keep = contains_xy(zone, X.ravel(), Y.ravel()).reshape(X.shape)
+        inU = contains_xy(self.U.buffer(1.0), X.ravel(), Y.ravel())
+        if inU.any():
+            pts = np.c_[X.ravel()[inU], Y.ravel()[inU]]
+            bed = self.idx.nearest_z(pts, r=40.0) - DECK - 0.4
+            Zf = Z.ravel().copy()
+            Zf[inU] = np.minimum(Zf[inU], bed)
+            Z = Zf.reshape(Z.shape)
         ny, nx = X.shape
         idx = np.arange(nx * ny).reshape(ny, nx)
         q = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], -1)
@@ -1268,6 +1380,7 @@ class Model:
         self.platform_furniture()
         self.build_parapets()
         self.build_arches()
+        self.build_overpasses()
         self.build_expressways()
         self.build_catenary()
         self.build_ground()
@@ -1283,24 +1396,33 @@ class Model:
     def export(self, out):
         """Write one .npy triple per material plus scene.json and station-sign PNGs (Blender-version neutral)."""
         os.makedirs(out, exist_ok=True)
-        mats = []
+        mats, tiles = [], []
+        T = 1000.0
         for mat, bk in self.sc.buckets.items():
             a = bk.arrays()
             if a is None:
                 continue
             v, f, uv, col, geo = a
-            np.save(os.path.join(out, mat + ".c.npy"), col.astype(np.float32))
-            np.save(os.path.join(out, mat + ".g.npy"), geo.astype(np.float32))
-            np.save(os.path.join(out, mat + ".v.npy"), v.astype(np.float32))
-            np.save(os.path.join(out, mat + ".f.npy"), f.astype(np.int32))
-            np.save(os.path.join(out, mat + ".uv.npy"), uv.astype(np.float32))
+            cen = v[f].mean(1)
+            key = np.floor(cen[:, :2] / T).astype(int)
+            for kx, ky in {tuple(k) for k in key}:
+                sel = np.where((key[:, 0] == kx) & (key[:, 1] == ky))[0]
+                ff = f[sel]
+                used, inv = np.unique(ff.ravel(), return_inverse=True)
+                name = "%s@%d_%d" % (mat, kx, ky)
+                np.save(os.path.join(out, name + ".v.npy"), v[used].astype(np.float32))
+                np.save(os.path.join(out, name + ".f.npy"), inv.reshape(-1, 3).astype(np.int32))
+                np.save(os.path.join(out, name + ".uv.npy"), uv[used].astype(np.float32))
+                np.save(os.path.join(out, name + ".c.npy"), col[used].astype(np.float32))
+                np.save(os.path.join(out, name + ".g.npy"), geo[used].astype(np.float32))
+                tiles.append([name, mat, (kx + 0.5) * T, (ky + 0.5) * T])
             mats.append(mat)
         cam, s = self.camera_path()
         stations = [(n, en, p.tolist()) for n, en, p in self.station_names()]
         for n, en, _ in stations:
             if "sign_" + n in mats:
                 sign_png(os.path.join(out, "sign_%s.png" % n), n, en)
-        json.dump(dict(materials=mats, camera=cam.tolist(), cam_s=s.tolist(), stations=stations, log=self.log),
+        json.dump(dict(materials=mats, tiles=tiles, camera=cam.tolist(), cam_s=s.tolist(), stations=stations, log=self.log),
                   open(os.path.join(out, "scene.json"), "w"), ensure_ascii=False)
 
 
