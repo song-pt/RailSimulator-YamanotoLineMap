@@ -6,10 +6,14 @@ D = os.path.expanduser('~/railwork/full/data')
 t0 = time.time()
 import pickle
 CK = os.path.expanduser('~/railwork/ckpt_structures.pkl')
+m = None
 if os.path.exists(CK):
-    m = pickle.load(open(CK, 'rb')); stages = []
-    print('resumed from checkpoint', flush=True)
-else:
+    try:
+        m = pickle.load(open(CK, 'rb')); stages = []
+        print('resumed from checkpoint', flush=True)
+    except Exception as ex:
+        print('checkpoint unreadable, rebuilding:', ex, flush=True); os.remove(CK); m = None
+if m is None:
     m = model.Model(D)
     print('init', round(time.time() - t0), 'tracks', len(m.tracks), 'main', round(m.main.length), flush=True)
     stages = ['build_track', 'build_platforms', 'build_structures', 'platform_meshes', 'platform_furniture', 'build_parapets',
@@ -18,7 +22,7 @@ for f in stages:
     t = time.time(); getattr(m, f)(); print(f, round(time.time() - t, 1), flush=True)
 if stages:
     try:
-        pickle.dump(m, open(CK, 'wb'), protocol=5); print('checkpoint saved', flush=True)
+        pickle.dump(m, open(CK + '.tmp', 'wb'), protocol=5); os.replace(CK + '.tmp', CK); print('checkpoint saved', flush=True)
     except Exception as ex:
         print('checkpoint not saved:', ex, flush=True)
         if os.path.exists(CK): os.remove(CK)
