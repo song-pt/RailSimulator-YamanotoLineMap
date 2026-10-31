@@ -357,6 +357,7 @@ class Model:
         U = unary_union([self.deck_union] + [p for p, _ in self.platforms])
         U = U.buffer(0.05).buffer(-0.05)
         self.U = U
+        self.U_closed = U.buffer(8.0).buffer(-8.0)
         lines = []
         plat_union = unary_union([p for p, _ in self.platforms]) if self.platforms else Polygon()
         n_ret = 0
@@ -377,6 +378,10 @@ class Model:
                 base = np.where(onplat & ~np.isnan(pz), pz, z)
                 g_out = self.dem(*(r + out * 1.5).T)
                 street, in_cut = self.street_info(r)
+                # gaps < 16 m between beds in one cutting are railway too: no wall up to street there
+                inner = contains_xy(self.U_closed.buffer(-1.0), *(r + out * 1.5).T)
+                in_cut &= ~inner
+                g_out = np.where(inner, base, g_out)
                 g_out = np.where(in_cut, np.maximum(g_out, street), g_out)   # cuttings: wall up to street level
                 cut = g_out > base + 0.8
                 top = np.where(cut, g_out + 1.1, base + 1.05)
@@ -1222,13 +1227,15 @@ class Model:
         xs = np.arange(minx, maxx + step, step); ys = np.arange(miny, maxy + step, step)
         X, Y = np.meshgrid(xs, ys)
         Z = self.dem(X.ravel(), Y.ravel()).reshape(X.shape)
+        from scipy.ndimage import gaussian_filter
+        Z = gaussian_filter(Z, 0.8)   # laser DEM noise next to the line reads as crumpled ground
         water = self.water_polys()
         if water:
             W = unary_union(water)
             inside = contains_xy(W.buffer(4.0), X.ravel(), Y.ravel()).reshape(X.shape)
             Z = np.where(inside, -1.5, Z)
         keep = contains_xy(zone, X.ravel(), Y.ravel()).reshape(X.shape)
-        inU = contains_xy(self.U.buffer(1.0), X.ravel(), Y.ravel())
+        inU = contains_xy(self.U_closed.buffer(1.0), X.ravel(), Y.ravel())
         cut_vert = np.zeros(X.size, bool)
         if inU.any():
             pts = np.c_[X.ravel()[inU], Y.ravel()[inU]]
@@ -1237,7 +1244,7 @@ class Model:
             Zf = Z.ravel().copy()
             Zf[inU] = np.minimum(Zf[inU], bed)
             Z = Zf.reshape(Z.shape)
-        band = contains_xy(self.U.buffer(16.0), X.ravel(), Y.ravel()) & ~inU
+        band = contains_xy(self.U_closed.buffer(16.0), X.ravel(), Y.ravel()) & ~inU
         if band.any():
             pts = np.c_[X.ravel()[band], Y.ravel()[band]]
             street, in_cut = self.street_info(pts)
