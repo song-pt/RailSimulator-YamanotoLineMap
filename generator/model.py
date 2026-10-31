@@ -1086,6 +1086,7 @@ class Model:
     # ------------------------------------------------------------------ expressways
     def build_expressways(self):
         sc = self.sc
+        self._U_out = self.U.buffer(1.0)
         for wid, w in self.osm.ways.items():
             t = w["tags"]
             if t.get("highway") not in ("motorway", "motorway_link") or t.get("tunnel"):
@@ -1124,7 +1125,7 @@ class Model:
                 k = int(np.searchsorted(s, s0))
                 k = min(k, len(p) - 1)
                 x, y = p[k]
-                if not self.clear_of_tracks(x, y, g[k], z[k] - 2.0, r=3.6) or contains_xy(self.U.buffer(1.0), x, y):
+                if not self.clear_of_tracks(x, y, g[k], z[k] - 2.0, r=3.6) or contains_xy(self._U_out, x, y):
                     continue
                 mk.boxes(sc, "concrete", [[x, y, (z[k] - 2 + g[k]) / 2]], [left[k][1], -left[k][0], 0], left[k], [2.0, 3.0, z[k] - 2 - g[k]])
 
