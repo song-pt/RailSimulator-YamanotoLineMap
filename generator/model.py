@@ -376,6 +376,8 @@ class Model:
                 pz = np.array([self.plat_top_at(a, b) for a, b in r])
                 base = np.where(onplat & ~np.isnan(pz), pz, z)
                 g_out = self.dem(*(r + out * 1.5).T)
+                street, in_cut = self.street_info(r)
+                g_out = np.where(in_cut, np.maximum(g_out, street), g_out)   # cuttings: wall up to street level
                 cut = g_out > base + 0.8
                 top = np.where(cut, g_out + 1.1, base + 1.05)
                 for m, mat in ((cut, "retaining"), (~cut, "parapet")):
@@ -386,6 +388,14 @@ class Model:
                         n_ret += mat == "retaining"
         self.parapet_lines = lines
         self.log.append("boundary wall runs: %d retaining" % n_ret)
+
+    def street_info(self, xy):
+        """(street level, in_cutting) at points, from the main-line profile (cutting: rail > 1.5 m below street)."""
+        net = self.net
+        sv = np.array([self.main.project(Point(a, b)) for a, b in xy])
+        k = np.clip(np.searchsorted(net.ms, sv), 0, len(net.ms) - 1)
+        near = np.array([self.main.distance(Point(a, b)) < 45.0 for a, b in xy])
+        return net.street[k], near & (net.base_h[k] < net.street[k] - 1.5)
 
     def wall_strip(self, r, zb, zt, out, mat, thick=0.25):
         """Wall of varying height along points r (N,2), standing on the boundary and extending outward."""
@@ -1225,6 +1235,14 @@ class Model:
             Zf = Z.ravel().copy()
             Zf[inU] = np.minimum(Zf[inU], bed)
             Z = Zf.reshape(Z.shape)
+        band = contains_xy(self.U.buffer(16.0), X.ravel(), Y.ravel()) & ~inU
+        if band.any():
+            pts = np.c_[X.ravel()[band], Y.ravel()[band]]
+            street, in_cut = self.street_info(pts)
+            Zf = Z.ravel().copy()
+            sel = np.where(band)[0][in_cut]
+            Zf[sel] = np.maximum(Zf[sel], street[in_cut] - 0.05)
+            Z = Zf.reshape(Z.shape)
         ny, nx = X.shape
         idx = np.arange(nx * ny).reshape(ny, nx)
         q = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], -1)
@@ -1347,6 +1365,8 @@ class Model:
             if not fp.intersects(ko_tree):
                 self.emit_lod2(b, facade); nk += 1
                 continue
+            if fp.intersection(ko_tree).area > 0.25 * fp.area:   # station / over-track structure
+                nd += 1; continue
             rest = fp.difference(ko_tree).buffer(-1.0).buffer(1.0)
             if rest.area < 40:
                 nd += 1; continue
