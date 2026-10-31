@@ -154,17 +154,17 @@ def make_material(name):
             bsdf.inputs["Emission Strength"].default_value = 0.6
         return mat
     P = {
-        "rail": lambda m: pbr(m, "rust", 0.6, (0.55, 0.42, 0.35), rough=0.75, metal=0.6),
+        "rail": lambda m: pbr(m, "rust", 0.6, (0.32, 0.26, 0.23), rough=0.8, metal=0.4),
         "rail_head": lambda m: flat(m, (0.75, 0.75, 0.76), 0.22, 1.0),
         "ballast": lambda m: pbr(m, "ballast", 1.6, (0.62, 0.6, 0.58), normal=1.0),
-        "slab_track": lambda m: pbr(m, "concrete_smooth", 3.0, (0.75, 0.75, 0.73)),
+        "slab_track": lambda m: pbr(m, "concrete", 3.0, (0.75, 0.75, 0.73)),
         "sleeper": lambda m: pbr(m, "sleeper", 1.5, (0.82, 0.8, 0.77)),
         "fastening": lambda m: flat(m, (0.12, 0.12, 0.12), 0.5, 0.6),
         "deck_top": lambda m: pbr(m, "concrete", 4.0, (0.55, 0.54, 0.52)),
         "brick": lambda m: pbr(m, "brick", 2.5, (1.0, 0.85, 0.8)),
         "concrete": lambda m: pbr(m, "concrete", 4.0, (0.85, 0.84, 0.82)),
         "girder": lambda m: pbr(m, "metal", 2.0, (0.35, 0.4, 0.45), metal=0.5),
-        "parapet": lambda m: pbr(m, "concrete_smooth", 2.0, (0.8, 0.8, 0.78)),
+        "parapet": lambda m: pbr(m, "concrete", 2.5, (0.88, 0.87, 0.85)),
         "platform": lambda m: pbr(m, "platform", 2.0, (0.75, 0.75, 0.74)),
         "platform_side": lambda m: pbr(m, "concrete", 3.0, (0.7, 0.7, 0.68)),
         "edge_white": lambda m: flat(m, (0.85, 0.85, 0.82), 0.5),
@@ -258,7 +258,11 @@ def key(frame, s):
 
 
 r = sc.render
-r.engine = "CYCLES"
+r.engine = "CYCLES" if opt.get("engine", "cycles") == "cycles" else "BLENDER_EEVEE_NEXT"
+if r.engine != "CYCLES":
+    sc.eevee.taa_render_samples = int(opt.get("samples", 8))
+    sc.eevee.use_shadows = True
+    sc.eevee.use_raytracing = False
 sc.cycles.device = "CPU"
 sc.cycles.samples = int(opt.get("samples", 12))
 sc.cycles.use_denoising = True
@@ -274,10 +278,11 @@ r.image_settings.file_format = "JPEG"; r.image_settings.quality = 92
 sc.render.use_persistent_data = True
 
 if "still" in opt:
-    key(1, float(opt["still"]))
-    sc.frame_set(1)
-    r.filepath = os.path.join(OUT, "still_%05d.jpg" % int(float(opt["still"])))
-    bpy.ops.render.render(write_still=True)
+    for v in str(opt["still"]).split(","):
+        key(1, float(v))
+        sc.frame_set(1)
+        r.filepath = os.path.join(OUT, "still_%05d.jpg" % int(float(v)))
+        bpy.ops.render.render(write_still=True)
 else:
     f0, f1 = opt.get("frames", (1, int((cam_s[-1] - cam_s[0]) / SPEED * FPS)))
     for f in range(f0, f1 + 1):

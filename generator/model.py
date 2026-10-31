@@ -327,14 +327,19 @@ class Model:
                 line = LineString(xy)
                 if not line.intersects(self.zone):
                     continue
-                mid = line.interpolate(0.5, normalized=True)
-                hits = sorted(self.idx.near(mid.x, mid.y, 4.0), key=lambda h: h[1])
-                if not hits:
-                    continue
-                tr = self.tracks[hits[0][0]]
-                s0, s1 = sorted([tr.line.project(Point(xy[0])), tr.line.project(Point(xy[-1]))])
-                if s1 - s0 > 30:
-                    spans.append((hits[0][0], s0, s1, side_of(tr, mid)))
+                zone = line.buffer(2.6)
+                for ti, tr in enumerate(self.tracks):
+                    if tr.line.distance(line) > 2.6:
+                        continue
+                    part = tr.line.intersection(zone)
+                    if part.length < 6:
+                        continue
+                    ends = [Point(c) for g in getattr(part, "geoms", [part]) for c in (g.coords[0], g.coords[-1])]
+                    ss = [tr.line.project(e) for e in ends]
+                    mid = tr.line.interpolate((min(ss) + max(ss)) / 2)
+                    # the platform is on the side of the edge line away from the track
+                    q = line.interpolate(line.project(mid))
+                    spans.append((ti, min(ss), max(ss), side_of(tr, q)))
             elif t.get("railway") == "platform" or t.get("public_transport") == "platform":
                 if xy[0] != xy[-1] or len(xy) < 4:
                     continue
@@ -345,7 +350,7 @@ class Model:
                     if tr.line.distance(P) > 3.0 or tr.line.intersection(P.buffer(-0.6)).length > 5:
                         continue
                     seg = tr.line.intersection(P.buffer(3.0))
-                    if seg.length < 30:
+                    if seg.length < 6:
                         continue
                     ends = [Point(c) for g in getattr(seg, "geoms", [seg]) for c in (g.coords[0], g.coords[-1])]
                     ss = [tr.line.project(e) for e in ends]
@@ -500,6 +505,12 @@ class Model:
         for P, ti in self.platforms:
             zt = float(np.max(self.idx.nearest_z(np.asarray(P.exterior.coords)[::3, :2], zref=self.tracks[ti].pts[:, 2].mean(), r=25.0))) + PLAT_H
             roof = P.buffer(-0.12)
+            # trim the roof wherever it would hang inside any track's car-body envelope
+            cut = [tr.line.buffer(1.85) for tr in self.tracks if tr.line.distance(P) < 4.0 and
+                   np.any(contains_xy(P.buffer(4.0), tr.pts[:, 0], tr.pts[:, 1]) &
+                          (tr.pts[:, 2] + 4.15 > zt + CANOPY_H) & (tr.pts[:, 2] - 1.0 < zt + CANOPY_H + 0.4))]
+            if cut:
+                roof = roof.difference(unary_union(cut))
             cols = [c for c, z in self.columns if contains_xy(P, c[0], c[1])]
             if not cols or roof.is_empty:
                 continue
