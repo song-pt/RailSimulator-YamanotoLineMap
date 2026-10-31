@@ -51,8 +51,10 @@ def check(m, region=None, tag="all"):
     rep.append("clearance violations [%s]: %d %s" % (tag, sum(viol.values()), viol))
     for lab, ex in examples.items():
         rep.append("  %s e.g. %s" % (lab, ex[:4]))
-    # nothing below ground on the driven line
-    cam, s = m.camera_path()
-    g = m.dem(cam[:, 0], cam[:, 1])
-    rep.append("driven rail min height above ground: %.2f m" % float((cam[:, 2] - g).min()))
+    # below-street running must be an open cutting (retaining walls) or an explicitly covered section
+    net = m.net
+    below = (net.base_h < net.street - 1.5)
+    cov = net.main_cls == "covered"
+    rep.append("main line below street: %.0f m open cutting, %.0f m covered; covered sections roofed: %s" % (
+        2 * np.sum(below & ~cov), 2 * np.sum(cov), any(pc["mode"] == "roof" and pc["covered"] for pc in m.pieces)))
     return rep

@@ -131,7 +131,7 @@ class Network:
         Lmat = sp.coo_matrix((vals, (rows, cols)), shape=(N, N)).tocsr()
         # nodes without any trusted anchor follow the base profile weakly
         weak = wsum == 0
-        target[weak] = base[weak]; wsum[weak] = 1e-3
+        target[weak] = base[weak] * 1e-3; wsum[weak] = 1e-3   # target holds weight x height
         for n, z in (level or {}).items():  # station levelling: tracks along one platform share a level
             if n in idx:
                 i = idx[n]

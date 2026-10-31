@@ -134,7 +134,8 @@ class Model:
         self.drive = drive
         self.main = self.net.main
         self.zone = self.net.zone
-        self.drive_line = substring(self.main, drive[0] - 50, drive[1] + 50)
+        L = self.main.length
+        self.drive_line = substring(self.main, max(0.0, drive[0] - 50), min(L, drive[1] + 50))   # (negative offsets would wrap)
         for tr in self.tracks:
             tr.near_main = tr.line.distance(self.drive_line) < DETAIL_DIST
         self.log = []
@@ -143,6 +144,18 @@ class Model:
     # ------------------------------------------------------------------ helpers
     def lower_tracks(self, x, y, z, r, dz=0.5):
         return [h for h in self.idx.near(x, y, r) if h[2] < z - dz]
+
+    def lower_under(self, fp, ti, zc, dz=0.45):
+        """Tracks lower than zc - dz anywhere within 3 m of a deck footprint: [(track, distance, z)]."""
+        found = {}
+        for c in self.idx.tree.query(fp.buffer(3.0), predicate="intersects"):
+            t2, i = self.idx.meta[c]
+            if t2 == ti:
+                continue
+            z = float(self.tracks[t2].pts[i:i + 2, 2].min())
+            if z < zc - dz:
+                found[t2] = (t2, 0.0, z)
+        return list(found.values())
 
     def clear_of_tracks(self, x, y, z0, z1, r=2.45):
         """True if a vertical member at (x,y) spanning z0..z1 stays out of every track envelope."""
@@ -250,7 +263,7 @@ class Model:
                 zc = float(sub[:, 2].mean())
                 fp = line.buffer(RIBBON, cap_style="flat", join_style="mitre")
                 mid = sub[len(sub) // 2]
-                low = self.lower_tracks(mid[0], mid[1], zc, RIBBON + 3.0, dz=0.45)
+                low = self.lower_under(fp, ti, zc)
                 if low:
                     cut = unary_union([self.tracks[t2].line.buffer(2.25) for t2, _, _ in low])
                     fp = fp.difference(cut)
