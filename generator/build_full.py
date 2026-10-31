@@ -1,11 +1,13 @@
-# Full-loop build: python3 -I generator/build_full.py  (data in ~/railwork/full/data, output ~/railwork/fullscene; resumes from ~/railwork/ckpt_structures.pkl)
+# Full-loop build: python3 -I generator/build_full.py
+# env RAIL_DATA (default ~/railwork/full/data), RAIL_SCENE (default ~/railwork/fullscene); resumes from <scene parent>/ckpt_structures.pkl
 import sys, os, time, json
-sys.path.insert(0, '/home/user/RailSimulator-YamanotoLineMap/generator')
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import model, validate
-D = os.path.expanduser('~/railwork/full/data')
+D = os.path.expanduser(os.environ.get('RAIL_DATA', '~/railwork/full/data'))
+OUT = os.path.expanduser(os.environ.get('RAIL_SCENE', '~/railwork/fullscene'))
 t0 = time.time()
 import pickle
-CK = os.path.expanduser('~/railwork/ckpt_structures.pkl')
+CK = os.path.join(os.path.dirname(OUT), 'ckpt_structures.pkl')
 m = None
 if os.path.exists(CK):
     try:
@@ -28,10 +30,10 @@ if stages:
 for f in ['build_parapets', 'build_arches', 'build_overpasses', 'build_expressways', 'build_catenary', 'build_ground', 'build_buildings']:
     t = time.time(); getattr(m, f)(); print(f, round(time.time() - t, 1), flush=True)
 t = time.time(); rep = validate.check(m); print('validate', round(time.time() - t, 1), flush=True); m.log += rep
-m.export(os.path.expanduser('~/railwork/fullscene'))
+m.export(OUT)
 print('\n'.join(m.log))
 print('gap report', m.gap_report)
-pickle.dump(m.cell_zref if hasattr(m, 'cell_zref') else {}, open(os.path.expanduser('~/railwork/cell_zref.pkl'), 'wb'))
+pickle.dump(m.cell_zref if hasattr(m, 'cell_zref') else {}, open(os.path.join(os.path.dirname(OUT), 'cell_zref.pkl'), 'wb'))
 print('triangles', sum(len(b.arrays()[1]) for b in m.sc.buckets.values() if b.arrays() is not None))
 # station positions along the main line for picking views
 st = [(n, round(m.main.project(__import__('shapely').geometry.Point(p)))) for n, en, p in m.station_names() if m.main.distance(__import__('shapely').geometry.Point(p)) < 150]
