@@ -479,9 +479,9 @@ class Model:
             cutp.append(P.difference(unary_union(cut)) if cut else P)
         allp = unary_union(cutp)
         self.platforms = []
-        for P in mk.polys(allp):
-            if P.area < 40:
-                continue
+        queue = [P for P in mk.polys(allp) if P.area >= 40]
+        while queue:
+            P = queue.pop()
             # final safety cut against every track whose envelope overlaps this platform's height band
             for _ in range(2):
                 zl = self.idx.nearest_z(np.asarray(P.exterior.coords)[:, :2], r=25.0)
@@ -496,9 +496,11 @@ class Model:
                         cut.append(tr.line.buffer(PLAT_EDGE - 0.001))
                 if cut:
                     P = P.difference(unary_union(cut))
-                P = max(mk.polys(P), key=lambda q: q.area, default=Polygon())
-                if P.is_empty:
-                    break
+                parts = sorted(mk.polys(P), key=lambda q: q.area)
+                if not parts:
+                    P = Polygon(); break
+                P = parts.pop()
+                queue += [q for q in parts if q.area >= 40]   # other pieces are re-checked on their own
             if P.is_empty or P.area < 40:
                 continue
             c = P.representative_point()
@@ -706,6 +708,7 @@ class Model:
     def build_catenary(self):
         sc = self.sc
         supports = {ti: [] for ti in range(len(self.tracks))}
+        self.sup_pts = []
         main = self.main
         s0, s1 = self.drive[0] - 400, self.drive[1] + 400
         col_pts = [c for c, _ in self.columns]
@@ -840,6 +843,7 @@ class Model:
         def register(t, ti, z, top):
             x, y = P + n * t
             supports[ti].append((self.tracks[ti].line.project(Point(x, y)), zig))
+            self.sup_pts.append((x, y, z))
             cov.add(ti)
             mk.segment_boxes(sc, "mast", [[x, y, top]], [[x, y, z + MESSENGER_H + 0.25]], 0.06, 0.06)
             mk.segment_boxes(sc, "mast", [[x, y, z + MESSENGER_H + 0.2]], [[x + n[0] * zig, y + n[1] * zig, z + CONTACT_H + 0.05]], 0.035, 0.035)
@@ -872,6 +876,13 @@ class Model:
         groups.append(cur)
         for g in groups:
             if need is not None and not any(h[1] in need for h in g):
+                continue
+            # already supported close by? (by position, since OSM splits one physical track into many ways)
+            sp = np.array(self.sup_pts) if self.sup_pts else np.zeros((0, 3))
+            near_sup = [len(sp) > 0 and bool(np.any((np.hypot(sp[:, 0] - (P + n * t)[0], sp[:, 1] - (P + n * t)[1]) < 22.0) & (np.abs(sp[:, 2] - z) < 1.5)))
+                        for t, ti, z, i in g]
+            if all(near_sup):
+                cov |= {h[1] for h in g}
                 continue
             ts = [h[0] for h in g]
             zg = float(np.median([h[2] for h in g]))
@@ -915,7 +926,7 @@ class Model:
                 x, y = P + n * m
                 base = self.base_z(x, y, zg)
                 mk.cylinders(sc, "mast", [[x, y, base]], beam_z + 0.35 - base, 0.16)
-                mk.boxes(sc, "concrete", [[x, y, base + 0.3]], [d[0], d[1], 0], [n[0], n[1], 0], [0.9, 0.9, 0.6])
+                mk.boxes(sc, "concrete", [[x, y, base + 0.2]], [d[0], d[1], 0], [n[0], n[1], 0], [0.6, 0.6, 0.4])
                 sc.obstacle(Point(x, y).buffer(0.2, quad_segs=2), base, beam_z, "mast")
             mk.segment_boxes(sc, "mast", [[A[0], A[1], beam_z + 0.2]], [[B[0], B[1], beam_z + 0.2]], 0.25, 0.35)
             mk.segment_boxes(sc, "mast", [[A[0], A[1], beam_z - 0.15]], [[B[0], B[1], beam_z - 0.15]], 0.12, 0.12)

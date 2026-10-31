@@ -234,6 +234,18 @@ def lowrise(mat, pattern, shop=False):
     bsdf.inputs["Specular IOR Level"].default_value = 0.25
 
 
+def desat(mat, tint):
+    """Replace a coloured scan by its luminance x tint (keeps the relief, drops the paint colour)."""
+    nt = mat.node_tree
+    bsdf = nt.nodes["Principled BSDF"]
+    src = bsdf.inputs["Base Color"].links[0].from_socket
+    bw = nt.nodes.new("ShaderNodeRGBToBW"); nt.links.new(src, bw.inputs["Color"])
+    mix = nt.nodes.new("ShaderNodeMix"); mix.data_type = "RGBA"; mix.blend_type = "MULTIPLY"; mix.inputs["Factor"].default_value = 1.0
+    nt.links.new(bw.outputs["Val"], mix.inputs[6]); mix.inputs[7].default_value = (*tint, 1)
+    gain = nt.nodes.new("ShaderNodeMath"); gain.operation = "MULTIPLY"
+    nt.links.new(mix.outputs[2], bsdf.inputs["Base Color"])
+
+
 def glass(mat):
     bsdf = mat.node_tree.nodes["Principled BSDF"]
     bsdf.inputs["Base Color"].default_value = (0.8, 0.85, 0.85, 1)
@@ -291,13 +303,13 @@ def make_material(name):
         "tactile": lambda m: flat(m, (0.9, 0.72, 0.05), 0.55),
         "psd_frame": lambda m: flat(m, (0.78, 0.8, 0.82), 0.35, 0.3),
         "column": lambda m: flat(m, (0.7, 0.72, 0.74), 0.4, 0.4),
-        "canopy_top": lambda m: pbr(m, "roof_sheet", 2.0, (0.6, 0.62, 0.64), metal=0.5),
+        "canopy_top": lambda m: (pbr(m, "roof_sheet", 2.0, (1, 1, 1), metal=0.3), desat(m, (0.58, 0.6, 0.62))),
         "canopy_under": lambda m: flat(m, (0.82, 0.83, 0.84), 0.6, 0.0, emit=((0.9, 0.92, 0.95), 0.25)),
         "canopy_fascia": lambda m: flat(m, (0.75, 0.77, 0.78), 0.4, 0.3),
         "metal": lambda m: flat(m, (0.5, 0.52, 0.55), 0.4, 0.7),
         "bench": lambda m: flat(m, (0.15, 0.45, 0.25), 0.45),
         "stair_pit": lambda m: flat(m, (0.08, 0.08, 0.09), 0.9),
-        "mast": lambda m: flat(m, (0.55, 0.57, 0.58), 0.45, 0.6),
+        "mast": lambda m: flat(m, (0.36, 0.37, 0.38), 0.5, 0.5),
         "insulator": lambda m: flat(m, (0.45, 0.3, 0.2), 0.3),
         "wire_copper": lambda m: flat(m, (0.45, 0.32, 0.22), 0.35, 1.0),
         "wire_steel": lambda m: flat(m, (0.25, 0.26, 0.27), 0.4, 1.0),
@@ -407,16 +419,16 @@ if "look" in opt:
         sv, side = item.split(":")
         eye, rot = pose(float(sv))
         yaw = rot[2] + math.radians(75 if side == "L" else -75)
-        cam.location = eye + np.array([0, 0, 1.5]); cam.rotation_euler = (math.radians(80), 0, yaw)
+        cam.location = eye + np.array([0, 0, 9.0]); cam.rotation_euler = (math.radians(68), 0, yaw)
         r.filepath = os.path.join(OUT, "look_%05d_%s.jpg" % (int(float(sv)), side))
         bpy.ops.render.render(write_still=True)
-elif "still" in opt:
+if "still" in opt:
     for v in str(opt["still"]).split(","):
         key(1, float(v))
         sc.frame_set(1)
         r.filepath = os.path.join(OUT, "still_%05d.jpg" % int(float(v)))
         bpy.ops.render.render(write_still=True)
-else:
+if "still" not in opt and "look" not in opt:
     f0, f1 = opt.get("frames", (1, int((cam_s[-1] - cam_s[0]) / SPEED * FPS)))
     for f in range(f0, f1 + 1):
         key(f, cam_s[0] + (f - 1) * SPEED / FPS)
