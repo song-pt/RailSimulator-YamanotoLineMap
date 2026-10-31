@@ -611,6 +611,8 @@ class Model:
                 else np.array(c.representative_point().coords)
             z = self.plat_z(pts, zref)
             self.sc.obstacle(c, float(z.min()) + dz0, float(z.max()) + dz1, label)
+            self.cell_zref = getattr(self, "cell_zref", {})
+            self.cell_zref[len(self.sc.obstacles) - 1] = zref   # validator re-evaluates the exact surface
 
     def plat_top_at(self, x, y):
         if not self.plat_tree:

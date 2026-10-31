@@ -43,9 +43,15 @@ def check(m, region=None, tag="all"):
                 for c in tree.query(poly, predicate="intersects"):
                     op, oa, ob, lab = obs[c]
                     if oa < zb + z1 and ob > za + z0:
-                        inter = op.intersection(poly).area
-                        if inter < 0.02:
+                        inter_g = op.intersection(poly)
+                        if inter_g.area < 0.02:
                             continue
+                        zr = getattr(m, "cell_zref", {}).get(c)
+                        if zr is not None:   # platform cell: test the exact platform top over the overlap
+                            pts = np.vstack([np.asarray(g.exterior.coords)[:, :2] for g in getattr(inter_g, "geoms", [inter_g]) if g.geom_type == "Polygon"])
+                            top = float(m.plat_z(pts, zr).max()) + 1.10
+                            if top <= za + z0 + 0.08:   # grade over one 2 m envelope segment
+                                continue
                         viol[lab] = viol.get(lab, 0) + 1
                         examples.setdefault(lab, []).append((tr.name, round(float(poly.centroid.x), 1), round(float(poly.centroid.y), 1), round(za + z0, 1)))
     rep.append("clearance violations [%s]: %d %s" % (tag, sum(viol.values()), viol))
