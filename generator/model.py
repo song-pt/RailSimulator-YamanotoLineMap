@@ -1229,8 +1229,10 @@ class Model:
             Z = np.where(inside, -1.5, Z)
         keep = contains_xy(zone, X.ravel(), Y.ravel()).reshape(X.shape)
         inU = contains_xy(self.U.buffer(1.0), X.ravel(), Y.ravel())
+        cut_vert = np.zeros(X.size, bool)
         if inU.any():
             pts = np.c_[X.ravel()[inU], Y.ravel()[inU]]
+            cut_vert[np.where(inU)[0][self.street_info(pts)[1]]] = True
             bed = self.idx.nearest_z(pts, r=40.0) - DECK - 0.4
             Zf = Z.ravel().copy()
             Zf[inU] = np.minimum(Zf[inU], bed)
@@ -1247,6 +1249,9 @@ class Model:
         idx = np.arange(nx * ny).reshape(ny, nx)
         q = np.stack([idx[:-1, :-1], idx[:-1, 1:], idx[1:, 1:], idx[1:, :-1]], -1)
         qk = keep[:-1, :-1] | keep[1:, 1:]
+        # in cuttings the retaining wall is the visible edge: no ground cell may reach into the railway footprint
+        cv = cut_vert.reshape(X.shape)
+        qk &= ~(cv[:-1, :-1] | cv[:-1, 1:] | cv[1:, 1:] | cv[1:, :-1])
         sc.b("ground").add(np.c_[X.ravel(), Y.ravel(), Z.ravel()], q[qk].reshape(-1, 4), np.c_[X.ravel(), Y.ravel()])
         # roads
         widths = {"trunk": 10.0, "primary": 9.0, "secondary": 7.5, "tertiary": 6.0, "residential": 3.5, "unclassified": 3.5,
