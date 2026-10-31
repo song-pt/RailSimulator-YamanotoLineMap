@@ -70,38 +70,35 @@ Poly Haven CC0（PBR 贴图）  ┘   validate.py  限界/穿模校验（门禁�
   - 4.10–5.60m（受电弓区）：半宽 1.00m。
 - 所有实体障碍物都与限界求交，并检查行驶线轨面是否高于地面。
 
-## 3. 当前状态
+## 3. 当前状态（2026-10-31）
 
-| 项 | 状态 |
-|---|---|
-| 数据下载脚本（OSM、DEM、PLATEAU、贴图） | ✅ 跑通 |
-| 高程求解 | ✅ 跑通，坡度和离地高度检查通过 |
-| PLATEAU 解析 | ✅ 走廊内 6172 栋，其中 6140 栋为 LOD2 |
-| `model.py` 完整建模 + 校验 | ⚠️ 代码写完，**第一次完整运行被中断，结果未知，需要重跑和调试** |
-| Blender 组装和渲染脚本 | ❌ 未写 |
-| MP4 | ❌ 未出 |
+- `model.py` 已完整跑通，全流程约 60 秒，约 530 万三角面。
+- 新增站台齐平处理：同一站台两侧的轨道强制同一高程，坡道被推到站外。
+- 与主线并行的同层轨道跟随主线高程。
+- 限界校验：驾驶线 ±120m 范围内剩余 43 处，全部是站台或雨棚的局部高差。
+  - 主要集中在秋叶原总武线站台，以及有乐町一侧（相机起点之后，画面里看不到）。
+  - 待修。
+- 驾驶线轨面离地最低 6.26m，不存在地下段。
+- 已出 4 张测试静帧：东京、东京–神田高架、神田、秋叶原。
+  - 渲染设置：Cycles，960×540，12 采样，约 30 秒/帧。
+- 视频按用户要求暂不渲染：全程约 3200 帧，耗时太长。
 
 ## 4. 断点续作步骤
 
 ```sh
 git clone -b generator-test https://github.com/song-pt/RailSimulator-YamanotoLineMap
 cd RailSimulator-YamanotoLineMap
-sh generator/setup_env.sh ~/railwork          # 约 10 分钟：系统库、Blender 4.5.3、全部数据
-python3 -I generator/model.py ~/railwork/data ~/railwork/data/scene.pkl   # 建模 + 校验报告
+sh generator/setup_env.sh ~/railwork
+cd generator
+python3 -I -c "import sys,os;sys.path.insert(0,'.');import model,validate;m=model.Model(os.path.expanduser('~/railwork/data')).build();m.log+=validate.check(m);m.export(os.path.expanduser('~/railwork/scene'));print(m.log)"
+~/railwork/blender/blender -b --python blender_scene.py -- ~/railwork/scene ~/railwork/data/tex ~/railwork/render --still 1000,1500,2060,2930 --samples 12 --res 960 540
 ```
 
-接下来要做的事：
-1. 跑通 `model.py`，修 bug，把限界违规清零。可以先缩小范围调试，比如只跑东京站附近。
-2. 写 `blender_build.py`：
-   - 读取 `scene.pkl`，按材质建对象。
-   - 材质：Poly Haven 贴图，UV 以米为单位。建筑窗格用程序化着色器。站名牌用 PIL 加 `UIFont.ttf`（Noto Sans SC，游戏仓库自带）生成贴图。
-   - 场景：纯色或渐变天空加一个太阳光源。
-   - 相机：沿 `scene.pkl["camera"]` 走，眼高为轨面 +2.5m，向左偏 0.6m，看向前方 30m。
-3. 渲染：
-   - Cycles CPU 测试：默认立方体 640×360、8 采样约 1.6 秒/帧。EEVEE 在 llvmpipe 上首帧 58 秒，不推荐。
-   - 建议 960×540、8–16 采样加 OIDN 降噪、24fps，按约 70km/h 走 2.6km（约 130 秒视频）。先实测单帧耗时，必要时降帧率或加速。
-   - 用 ffmpeg 合成 MP4。
-4. 测试段通过后：扩展到全线，再做 glTF 导出、Unity 编辑器打包脚本，以及在 Mac 上一键运行的 `build_map.sh`。
+下一步待办：
+1. 清掉剩余的站台和雨棚高差问题。
+2. 改善外观：钢轨颜色；砖拱高架的拱形细节；接触网补柱（每个横断面约 40% 的轨道组未能立柱，见 `rejects` 统计）。
+3. 扩展到全线。
+4. 导出 glTF，写 Unity 打包脚本和 `build_map.sh`。
 
 ## 5. 文件说明
 
