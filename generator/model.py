@@ -1122,11 +1122,41 @@ class Model:
             keepout = unary_union([keepout] + [e.buffer(0.5) for e in exp])
         ko_tree = keepout
         nk = nc = nd = 0
-        for b in B:
-            fp = Polygon(b["footprint"]).buffer(0)
-            if fp.is_empty or not fp.intersects(self.zone):
+        B = [b for b in B if not Polygon(b["footprint"]).buffer(0).is_empty and Polygon(b["footprint"]).buffer(0).intersects(self.zone)]
+        fps = [Polygon(b["footprint"]).buffer(0) for b in B]
+        tree = STRtree(fps)
+        parent = list(range(len(B)))
+
+        def find(i):
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]; i = parent[i]
+            return i
+        drop = set()
+        for i, f in enumerate(fps):
+            hi = B[i]["zmax"] - B[i]["zmin"]
+            for j in tree.query(f.buffer(0.35)):
+                if j <= i or j in drop:
+                    continue
+                hj = B[j]["zmax"] - B[j]["zmin"]
+                ov = f.intersection(fps[j]).area
+                if ov > 0.6 * min(f.area, fps[j].area) and abs(B[i]["zmax"] - B[j]["zmax"]) < 1.5:
+                    drop.add(j if fps[j].area <= f.area else i)    # duplicate entry of the same building
+                    continue
+                if abs(hi - hj) < 2.5 and max(hi, hj) <= 25:       # one visible volume -> one colour and style
+                    parent[find(j)] = find(i)
+        style_of = {}
+        for i, b in enumerate(B):
+            if i in drop:
+                nd += 1; continue
+            root = find(i)
+            if root not in style_of:
+                style_of[root] = self.facade_for(B[root])
+            b["_style"] = style_of[root]
+        for i, b in enumerate(B):
+            if i in drop:
                 continue
-            facade = self.facade_for(b)
+            fp = fps[i]
+            facade = b["_style"]
             if not fp.intersects(ko_tree):
                 self.emit_lod2(b, facade); nk += 1
                 continue
@@ -1137,11 +1167,32 @@ class Model:
             for q in mk.polys(rest):
                 if q.area < 25:
                     continue
-                mk.prism(sc, "roof", facade[0], segmentize(q, 6.0), top, b["zmin"] - 0.5, side_v0=b["zmin"],
-                         col_top=facade[2], col_side=facade[1])
+                self.block(q.simplify(0.3), b["zmin"], top, facade)
                 sc.obstacle(q, b["zmin"], top, "building")
             nc += 1
         self.log.append("buildings kept %d, clipped %d, dropped %d" % (nk, nc, nd))
+
+    def block(self, q, z0, top, style):
+        """Flat-roofed extrusion with whole-wall quads (window layout needs per-wall width / height)."""
+        sc = self.sc
+        mat, wall_col, roof_col = style
+        pts, tri = mk.triangulate(q)
+        if len(tri):
+            a, b, c = pts[tri[:, 0]], pts[tri[:, 1]], pts[tri[:, 2]]
+            cr = (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+            tri = np.where(cr[:, None] < 0, tri[:, ::-1], tri)
+            sc.b("roof").add(np.c_[pts, np.full(len(pts), top)], tri, pts, roof_col)
+        for ring in [q.exterior] + list(q.interiors):
+            r = np.asarray(ring.coords)
+            if ring.is_ccw != (ring is q.exterior):
+                r = r[::-1]
+            for p0, p1 in zip(r[:-1], r[1:]):
+                L = float(np.hypot(*(p1 - p0)))
+                if L < 0.05:
+                    continue
+                V = np.array([[*p0, z0 - 0.5], [*p1, z0 - 0.5], [*p1, top], [*p0, top]])
+                uv = np.array([[0, -0.5], [L, -0.5], [L, top - z0], [0, top - z0]])
+                sc.b(mat).add(V, np.array([[0, 1, 2, 3]]), uv, wall_col, (L, top - z0, 1.0))
 
     def facade_for(self, b):
         """(wall material, wall colour, roof colour). Below 25 m: matte Japanese low-rise styles with per-building colour."""
@@ -1196,12 +1247,15 @@ class Model:
             is_wall = kind == "WallSurface" or (kind == "Mixed" and abs(nrm[2]) < 0.3)
             if is_wall:
                 hd = np.array([-nrm[1], nrm[0], 0.0]); hd /= np.linalg.norm(hd) + 1e-9
-                uv = np.c_[r @ hd, r[:, 2] - z0]
-                mat, col = facade, wall_col
+                u = r @ hd
+                u0, u1 = float(u.min()), float(u.max())
+                # wall top = eave height at the wall's two ends (gable triangles get no windows)
+                ends = (u - u0 < 0.3) | (u1 - u < 0.3)
+                top = float(r[ends, 2].max()) - z0
+                uv = np.c_[u - u0, r[:, 2] - z0]
+                sc.b(facade).add(r, tri, uv, wall_col, (u1 - u0, top, 1.0))
             else:
-                uv = r[:, :2]
-                mat, col = "roof", roof_col
-            sc.b(mat).add(r, tri, uv, col)
+                sc.b("roof").add(r, tri, r[:, :2], roof_col)
         fp = Polygon(b["footprint"]).buffer(0)
         sc.obstacle(fp, b["zmin"], b["zmax"], "building")
 
@@ -1234,8 +1288,9 @@ class Model:
             a = bk.arrays()
             if a is None:
                 continue
-            v, f, uv, col = a
+            v, f, uv, col, geo = a
             np.save(os.path.join(out, mat + ".c.npy"), col.astype(np.float32))
+            np.save(os.path.join(out, mat + ".g.npy"), geo.astype(np.float32))
             np.save(os.path.join(out, mat + ".v.npy"), v.astype(np.float32))
             np.save(os.path.join(out, mat + ".f.npy"), f.astype(np.int32))
             np.save(os.path.join(out, mat + ".uv.npy"), uv.astype(np.float32))

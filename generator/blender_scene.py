@@ -82,6 +82,24 @@ def flat(mat, color, rough=0.6, metal=0.0, emit=None):
         bsdf.inputs["Emission Strength"].default_value = emit[1]
 
 
+def layout(nt, M, U, V, bay, floor):
+    """Whole-window grid on one wall: an integer number of bays centred on the wall (>= 0.4 m margins),
+    and only floors whose full height stays below the wall top minus a 0.5 m parapet.
+    Returns (fu, fv, ok, cellx, celly) with fu/fv the position inside the bay / floor cell."""
+    geo = nt.nodes.new("ShaderNodeAttribute"); geo.attribute_name = "Geo"
+    gs = nt.nodes.new("ShaderNodeSeparateXYZ"); nt.links.new(geo.outputs["Vector"], gs.inputs["Vector"])
+    W, H, flag = gs.outputs["X"], gs.outputs["Y"], gs.outputs["Z"]
+    n = M("FLOOR", M("DIVIDE", M("SUBTRACT", W, 0.8), bay))
+    nB = M("MULTIPLY", n, bay)
+    uu = M("SUBTRACT", U, M("MULTIPLY", M("SUBTRACT", W, nB), 0.5))
+    ok_u = M("MULTIPLY", M("GREATER_THAN", uu, 0.0), M("LESS_THAN", uu, nB))
+    k = M("FLOOR", M("DIVIDE", V, floor))
+    ok_v = M("LESS_THAN", M("MULTIPLY", M("ADD", k, 1.0), floor), M("SUBTRACT", H, 0.5))
+    ok = M("MULTIPLY", M("MULTIPLY", ok_u, ok_v), M("GREATER_THAN", flag, 0.5))
+    fu = M("FRACT", M("DIVIDE", uu, bay)); fv = M("FRACT", M("DIVIDE", V, floor))
+    return fu, fv, ok, M("FLOOR", M("DIVIDE", uu, bay)), k, ok_u
+
+
 def windows(mat, wall_tex, size, tint, bay=3.2, floor=3.6, glass_frac=(0.62, 0.55), shop=True):
     """Facade: textured wall with a procedural window grid driven by UV metres (u along wall, v height)."""
     nt = mat.node_tree
@@ -104,21 +122,20 @@ def windows(mat, wall_tex, size, tint, bay=3.2, floor=3.6, glass_frac=(0.62, 0.5
                 nt.links.new(b, m.inputs[1])
         return m.outputs[0]
 
-    fu = math_node("FRACT", math_node("DIVIDE", sep.outputs["X"], bay))
-    fv = math_node("FRACT", math_node("DIVIDE", sep.outputs["Y"], floor))
+    fu, fv, ok, cx, cy, ok_u = layout(nt, math_node, sep.outputs["X"], sep.outputs["Y"], bay, floor)
     gu = math_node("LESS_THAN", math_node("ABSOLUTE", math_node("SUBTRACT", fu, 0.5)), glass_frac[0] / 2)
     gv = math_node("LESS_THAN", math_node("ABSOLUTE", math_node("SUBTRACT", fv, 0.55)), glass_frac[1] / 2)
     win = math_node("MULTIPLY", gu, gv)
     above = math_node("GREATER_THAN", sep.outputs["Y"], 4.2)
-    win = math_node("MULTIPLY", win, above)
+    win = math_node("MULTIPLY", math_node("MULTIPLY", win, above), ok)
     if shop:  # ground floor shop fronts
         low = math_node("LESS_THAN", sep.outputs["Y"], 3.6)
         sg = math_node("LESS_THAN", math_node("ABSOLUTE", math_node("SUBTRACT", fu, 0.5)), 0.42)
-        win = math_node("MAXIMUM", win, math_node("MULTIPLY", low, math_node("MULTIPLY", sg, math_node("GREATER_THAN", sep.outputs["Y"], 0.3))))
+        win = math_node("MAXIMUM", win, math_node("MULTIPLY", ok_u, math_node("MULTIPLY", low, math_node("MULTIPLY", sg, math_node("GREATER_THAN", sep.outputs["Y"], 0.3)))))
     # per-window variation (some lit / curtains)
     cell = nt.nodes.new("ShaderNodeCombineXYZ")
-    nt.links.new(math_node("FLOOR", math_node("DIVIDE", sep.outputs["X"], bay)), cell.inputs["X"])
-    nt.links.new(math_node("FLOOR", math_node("DIVIDE", sep.outputs["Y"], floor)), cell.inputs["Y"])
+    nt.links.new(cx, cell.inputs["X"])
+    nt.links.new(cy, cell.inputs["Y"])
     wn = nt.nodes.new("ShaderNodeTexWhiteNoise"); wn.noise_dimensions = "3D"
     nt.links.new(cell.outputs["Vector"], wn.inputs["Vector"])
     ramp = nt.nodes.new("ShaderNodeValToRGB")
@@ -207,19 +224,19 @@ def lowrise(mat, pattern, shop=False):
     wallc = wall.outputs[2]
 
     # windows: 3.6 m bays, 2.9 m floors, aluminium sash frame around dark glass
-    fu = M("FRACT", M("DIVIDE", U, 3.6)); fv = M("FRACT", M("DIVIDE", V, 2.9))
+    fu, fv, ok, cx, cy, ok_u = layout(nt, M, U, V, 3.6, 2.9)
     du = M("ABSOLUTE", M("SUBTRACT", fu, 0.5)); dv = M("ABSOLUTE", M("SUBTRACT", fv, 0.52))
     inner = M("MULTIPLY", M("LESS_THAN", du, 0.20), M("LESS_THAN", dv, 0.19))
     outer = M("MULTIPLY", M("LESS_THAN", du, 0.215), M("LESS_THAN", dv, 0.205))
-    floor_ok = M("GREATER_THAN", V, 3.1 if shop else 0.8)
+    floor_ok = M("MULTIPLY", M("GREATER_THAN", V, 3.1 if shop else 0.8), ok)
     inner = M("MULTIPLY", inner, floor_ok); outer = M("MULTIPLY", outer, floor_ok)
     if shop:   # ground-floor shop front / shutter
         low = M("MULTIPLY", M("LESS_THAN", V, 2.7), M("GREATER_THAN", V, 0.15))
-        sw = M("LESS_THAN", M("ABSOLUTE", M("SUBTRACT", M("FRACT", M("DIVIDE", U, 5.0)), 0.5)), 0.44)
+        sw = M("MULTIPLY", M("LESS_THAN", M("ABSOLUTE", M("SUBTRACT", fu, 0.5)), 0.46), ok_u)
         inner = M("MAXIMUM", inner, M("MULTIPLY", low, sw))
         outer = M("MAXIMUM", outer, M("MULTIPLY", M("MULTIPLY", M("LESS_THAN", V, 2.85), M("GREATER_THAN", V, 0.05)), sw))
     cell = nt.nodes.new("ShaderNodeCombineXYZ")
-    L(M("FLOOR", M("DIVIDE", U, 3.6)), cell.inputs["X"]); L(M("FLOOR", M("DIVIDE", V, 2.9)), cell.inputs["Y"])
+    L(cx, cell.inputs["X"]); L(cy, cell.inputs["Y"])
     wn = nt.nodes.new("ShaderNodeTexWhiteNoise"); wn.noise_dimensions = "3D"; L(cell.outputs["Vector"], wn.inputs["Vector"])
     ramp = nt.nodes.new("ShaderNodeValToRGB")
     ramp.color_ramp.elements[0].color = (0.03, 0.035, 0.04, 1); ramp.color_ramp.elements[1].color = (0.14, 0.15, 0.16, 1)
@@ -351,6 +368,11 @@ for name in meta["materials"]:
         C = np.load(cpath).astype(np.float32)
         ca = me.color_attributes.new("Col", "FLOAT_COLOR", "POINT")
         ca.data.foreach_set("color", np.c_[C, np.ones(len(C), np.float32)].ravel())
+    gpath = os.path.join(SCENE, name + ".g.npy")
+    if os.path.exists(gpath):
+        G = np.load(gpath).astype(np.float32)
+        ga = me.attributes.new("Geo", "FLOAT_VECTOR", "POINT")
+        ga.data.foreach_set("vector", G.ravel())
     me.update(calc_edges=True)
     me.validate(clean_customdata=False)
     ob = bpy.data.objects.new(name, me)

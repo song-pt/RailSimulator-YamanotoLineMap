@@ -10,10 +10,10 @@ from shapely.geometry import Polygon, MultiPolygon
 
 class Bucket:
     def __init__(self):
-        self.v, self.f, self.uv, self.c = [], [], [], []   # verts, faces, uv per vertex, linear rgb per vertex
+        self.v, self.f, self.uv, self.c, self.g = [], [], [], [], []   # verts, faces, uv, linear rgb, facade geometry (wall width, wall top, flag)
         self.n = 0
 
-    def add(self, verts, faces, uvs, col=None):
+    def add(self, verts, faces, uvs, col=None, geo=None):
         verts = np.asarray(verts, np.float64).reshape(-1, 3)
         uvs = np.asarray(uvs, np.float64).reshape(-1, 2)
         faces = np.asarray(faces, np.int64)
@@ -21,6 +21,7 @@ class Bucket:
             return
         self.v.append(verts); self.uv.append(uvs); self.f.append(faces + self.n)
         self.c.append(np.broadcast_to(np.asarray(col if col is not None else (1.0, 1.0, 1.0), np.float32), (len(verts), 3)))
+        self.g.append(np.broadcast_to(np.asarray(geo if geo is not None else (0.0, 0.0, 0.0), np.float32), (len(verts), 3)))
         self.n += len(verts)
 
     def arrays(self):
@@ -32,7 +33,7 @@ class Bucket:
                 tris.append(f)
             else:  # quads -> two triangles
                 tris.append(f[:, [0, 1, 2]]); tris.append(f[:, [0, 2, 3]])
-        return np.concatenate(self.v), np.concatenate(tris), np.concatenate(self.uv), np.concatenate(self.c)
+        return np.concatenate(self.v), np.concatenate(tris), np.concatenate(self.uv), np.concatenate(self.c), np.concatenate(self.g)
 
 
 class Scene:
