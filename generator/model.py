@@ -4,7 +4,7 @@ All placement goes through explicit clearance rules (see validate.py), so masts,
 canopies and buildings never enter a track's kinematic envelope, and nothing that should
 sit on a structure floats or sinks below ground.
 """
-import math, os, pickle, sys, zlib
+import json, math, os, pickle, sys, zlib
 import numpy as np
 from shapely import segmentize, distance as sdist, points as spoints, contains_xy
 from shapely.geometry import LineString, Point, Polygon, MultiPolygon, MultiLineString
@@ -24,7 +24,7 @@ SLEEPER_TOP = -RAIL_H - 0.010
 SLEEPER_H = 0.17
 BALLAST_TOP = -0.25
 DECK = 0.62                        # rail top -> structure deck top
-RIBBON = 2.9                       # deck half width around a track
+RIBBON = 3.2                       # deck half width around a track
 PLAT_EDGE = 1.58                   # platform edge from track centre
 PLAT_H = 1.10                      # platform top above rail
 CANOPY_H = 3.45                    # canopy underside above platform
@@ -103,6 +103,7 @@ class Model:
         for tr in self.tracks:
             tr.near_main = tr.line.distance(self.drive_line) < DETAIL_DIST
         self.log = []
+        self.level_stations()
 
     # ------------------------------------------------------------------ helpers
     def lower_tracks(self, x, y, z, r, dz=0.5):
@@ -114,6 +115,44 @@ class Model:
             if z - 0.5 < z1 and z + 6.0 > z0:
                 return False
         return True
+
+    def level_stations(self):
+        """Second height pass: every platform span and the track across its platform get one common level."""
+        spans = self.platform_spans()
+        level = {}
+        for ti, s0, s1, side in spans:
+            tr = self.tracks[ti]
+            sm = (s0 + s1) / 2
+            q = np.array(tr.line.interpolate(sm).coords[0])
+            a = np.array(tr.line.interpolate(max(0, sm - 1)).coords[0]); b = np.array(tr.line.interpolate(min(tr.line.length, sm + 1)).coords[0])
+            d = (b - a) / max(1e-9, np.linalg.norm(b - a)); n = np.array([-d[1], d[0]]) * side
+            zt = float(np.interp(sm, mk.cumlen(tr.pts), tr.pts[:, 2]))
+            group = [ti]
+            ray = LineString([q + n * 0.6, q + n * 22.0])
+            best = None
+            for c in self.idx.tree.query(ray, predicate="intersects"):
+                t2, i2 = self.idx.meta[c]
+                if t2 != ti and abs(self.tracks[t2].pts[i2, 2] - zt) < 3.0:
+                    dd = Point(q).distance(self.idx.segs[c].intersection(ray))
+                    if best is None or dd < best[0]:
+                        best = (dd, t2)
+            if best:
+                group.append(best[1])
+            # the whole connected run of ways alongside the platform
+            area = LineString([tr.line.interpolate(v).coords[0] for v in np.linspace(s0, s1, 20)]).buffer(25.0)
+            members = [t for t in range(len(self.tracks)) if t in group or
+                       (self.tracks[t].line.intersects(area) and any(self.tracks[t].line.distance(self.tracks[g].line) < 0.5 and
+                        self.tracks[t].tags.get("name") == self.tracks[g].tags.get("name") for g in group))]
+            zs = [float(self.tracks[t].pts[contains_xy(area, self.tracks[t].pts[:, 0], self.tracks[t].pts[:, 1]), 2].mean())
+                  for t in members if contains_xy(area, self.tracks[t].pts[:, 0], self.tracks[t].pts[:, 1]).any()]
+            zl = float(np.mean(zs)) if zs else zt
+            for t in members:
+                for nd in self.tracks[t].nodes:
+                    if contains_xy(area, *self.osm.xy(nd)):
+                        level[nd] = zl
+        self.net.solve_heights(level)
+        self.idx = TrackIdx(self.tracks)
+        self.log.append("station levelling: %d nodes pinned" % len(level))
 
     # ------------------------------------------------------------------ track
     def build_track(self):
@@ -226,7 +265,7 @@ class Model:
                 g = float(self.dem(x, y))
                 if top - g < 1.0:
                     break
-                if not self.clear_of_tracks(x, y, g, top, r=2.5):
+                if not self.clear_of_tracks(x, y, g, top, r=2.95):
                     continue
                 mk.boxes(self.sc, "concrete", [[x, y, (top + g) / 2]], t[k], left[k], [1.4, 1.4, top - g])
                 self.sc.obstacle(Point(x, y).buffer(1.0, quad_segs=2), g, top, "pier")
@@ -350,10 +389,16 @@ class Model:
         # cut each span polygon by the envelopes of tracks on the same level, then merge
         cutp = []
         for P, ti in polys:
-            zt = float(self.tracks[ti].pts[:, 2].mean())
-            cut = [tr.line.buffer(PLAT_EDGE - 0.001) for tr in self.tracks
-                   if tr.line.distance(P) < 3.0 and abs(float(self.idx.nearest_z(np.array([P.representative_point().coords[0]]), zref=zt, r=40)[0]) - zt) < 3
-                   and abs(tr.pts[:, 2].mean() - zt) < 2.5]
+            c = P.representative_point()
+            zt = float(self.idx.nearest_z(np.array([c.coords[0]]), r=25)[0])
+            cut = []
+            for tr in self.tracks:
+                if tr.line.distance(P) > 3.0:
+                    continue
+                near = contains_xy(P.buffer(3.0), tr.pts[:, 0], tr.pts[:, 1])
+                zq = tr.pts[near, 2] if near.any() else tr.pts[:, 2]
+                if np.any((zq - zt > -7.0) & (zq - zt < 6.0)):   # envelope overlaps the platform / canopy band
+                    cut.append(tr.line.buffer(PLAT_EDGE - 0.001))
             cutp.append(P.difference(unary_union(cut)) if cut else P)
         allp = unary_union(cutp)
         self.platforms = []
@@ -366,6 +411,23 @@ class Model:
         self.span_geo = span_geo
         self.plat_tree = STRtree([p for p, _ in self.platforms]) if self.platforms else None
         self.log.append("platforms: %d polygons from %d spans" % (len(self.platforms), len(spans)))
+
+    def cells(self, P, size=3.0):
+        from shapely.geometry import box
+        x0, y0, x1, y1 = P.bounds
+        out = []
+        for x in np.arange(x0, x1, size):
+            for y in np.arange(y0, y1, size):
+                c = P.intersection(box(x, y, x + size, y + size))
+                if not c.is_empty and c.area > 0.01:
+                    out.append(c)
+        return out
+
+    def local_obstacles(self, P, zref, dz0, dz1, label):
+        """Register a polygon as obstacle cells whose heights follow the local rail level."""
+        for c in self.cells(P):
+            z = float(self.idx.nearest_z(np.array([c.representative_point().coords[0]]), zref=zref, r=25.0)[0])
+            self.sc.obstacle(c, z + dz0, z + dz1, label)
 
     def plat_top_at(self, x, y):
         if not self.plat_tree:
@@ -383,8 +445,8 @@ class Model:
             ztop = lambda xy, zr=zref: self.idx.nearest_z(xy, zref=zr, r=25.0) + PLAT_H
             zslab = lambda xy, zr=zref: self.idx.nearest_z(xy, zref=zr, r=25.0) - DECK - SLAB
             mk.prism(sc, "platform", "platform_side", Pd, ztop, zslab, bottom=True)
-            zt = float(self.tracks[ti].pts[:, 2].mean())
-            sc.obstacle(P, zt - DECK - SLAB, zt + PLAT_H, "platform")
+            self.local_obstacles(P, zref, -DECK - SLAB, PLAT_H, "platform")
+            zt = zref
             # fill below the platform slab down to ground, except above lower tracks
             low = [tr.line.buffer(2.6) for tr in self.tracks if tr.line.distance(P) < 3 and tr.pts[:, 2].mean() < zt - 1.5]
             fill = P.difference(unary_union(low)) if low else P
@@ -422,8 +484,9 @@ class Model:
                 # door panels between posts (lower opaque band + glazing)
                 mk.boxes(sc, "psd_frame", pos + [0, 0, 0.6], Tp, Lp, [1.95, 0.14, 1.2])
                 mk.boxes(sc, "psd_frame", pos + [0, 0, 1.27], Tp, Lp, [1.98, 0.18, 0.14])
-                for q in pos:
-                    sc.obstacle(Point(q[0], q[1]).buffer(0.5, quad_segs=2), q[2], q[2] + 1.35, "psd")
+                for q, tq, lq in zip(pos, Tp, Lp):
+                    c4 = [q[:2] + tq[:2] * a * 1.0 + lq[:2] * b * 0.09 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+                    sc.obstacle(Polygon(c4), q[2], q[2] + 1.35, "psd")
             # columns along the platform middle, canopy is built per platform polygon below
             s_m = np.arange(6, len(mids) - 6, 12)
             for k in s_m:
@@ -435,7 +498,7 @@ class Model:
                 self.columns.append((c, z + PLAT_H))
         # canopies: platform polygons shrunk at the ends
         for P, ti in self.platforms:
-            zt = float(np.median(self.idx.nearest_z(np.asarray(P.exterior.coords)[::5, :2], zref=self.tracks[ti].pts[:, 2].mean(), r=25.0))) + PLAT_H
+            zt = float(np.max(self.idx.nearest_z(np.asarray(P.exterior.coords)[::3, :2], zref=self.tracks[ti].pts[:, 2].mean(), r=25.0))) + PLAT_H
             roof = P.buffer(-0.12)
             cols = [c for c, z in self.columns if contains_xy(P, c[0], c[1])]
             if not cols or roof.is_empty:
@@ -446,7 +509,8 @@ class Model:
             for q in mk.polys(roof):
                 mk.prism(sc, "canopy_top", "canopy_fascia", segmentize(q, 3.0), zt + CANOPY_H + 0.35, zt + CANOPY_H, bottom=False)
                 mk.prism(sc, "canopy_under", "canopy_fascia", segmentize(q, 3.0), zt + CANOPY_H, zt + CANOPY_H - 0.001, top_only=True)
-                sc.obstacle(q, zt + CANOPY_H, zt + CANOPY_H + 0.35, "canopy")
+                for cell in self.cells(q):
+                    sc.obstacle(cell, zt + CANOPY_H, zt + CANOPY_H + 0.35, "canopy")
             cb = np.array([[c[0], c[1], zt] for c in cols])
             mk.cylinders(sc, "column", cb, CANOPY_H, 0.17)
             for c in cols:
@@ -475,11 +539,13 @@ class Model:
                     continue
                 ax = np.array([d[0], d[1], 0.0]); ay = np.array([-d[1], d[0], 0.0])
                 cc = np.array([c[0] + d[0] * 6, c[1] + d[1] * 6, zt])
+                fp = Polygon([cc[:2] + ax[:2] * a * 5.6 + ay[:2] * b * 1.45 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
+                if not P.buffer(-1.0).contains(fp):
+                    continue
                 mk.boxes(sc, "stair_pit", [cc + [0, 0, 0.005]], ax, ay, [11.0, 2.6, 0.01])
                 for sd in (-1, 1):
                     mk.boxes(sc, "psd_frame", [cc + ay * sd * 1.35 + [0, 0, 0.55]], ax, ay, [11.0, 0.1, 1.1])
                 mk.boxes(sc, "psd_frame", [cc - ax * 5.5 + [0, 0, 0.55]], ax, ay, [0.1, 2.7, 1.1])
-                fp = Polygon([cc[:2] + ax[:2] * a * 5.6 + ay[:2] * b * 1.45 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))])
                 sc.obstacle(fp, zt, zt + 1.1, "stairs")
 
     def platform_dir(self, P, c):
@@ -560,7 +626,7 @@ class Model:
             a = np.c_[[np.interp(dd, s, cw[:, j]) for j in range(3)]].T
             b = np.c_[[np.interp(dd, s, mw[:, j]) for j in range(3)]].T
             mk.segment_boxes(sc, "wire_steel", a, b, 0.008, 0.008)
-        self.log.append("gantries placed: %d" % nmast)
+        self.log.append("gantries placed: %d, rejects %s" % (nmast, getattr(self, "why", {})))
 
     def ceiling(self, tr):
         """Lowest structure soffit above each track point (relative to rail), default high."""
@@ -611,7 +677,7 @@ class Model:
         for g in groups:
             ts = [h[0] for h in g]
             zg = float(np.median([h[2] for h in g]))
-            cand = [ts[0] - 2.6, ts[-1] + 2.6]
+            cand = [ts[0] - 2.5, ts[-1] + 2.5]
             # intermediate masts in wide gaps (platform middles etc.) to bound the beam span
             for (t1, *_), (t2, *_) in zip(g[:-1], g[1:]):
                 if t2 - t1 > 7.0:
@@ -619,20 +685,34 @@ class Model:
             masts = []
             for t in sorted(cand):
                 okm = None
-                for dt in (0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2):
-                    tt = t + dt
+                outer = t < ts[0] or t > ts[-1]
+                steps = (0, 0.25, 0.5) if outer else (0, 0.4, -0.4, 0.8, -0.8, 1.2, -1.2)
+                for dt in steps:
+                    tt = t + (dt if not outer else (-dt if t < ts[0] else dt))
                     x, y = P + n * tt
                     if not self.mast_ok(x, y, zg, col_pts):
                         continue
                     okm = tt; break
                 masts.append(okm)
-            if masts[0] is None or masts[-1] is None:
+            if masts[0] is None and masts[-1] is None:
+                self.why["group_fail"] = self.why.get("group_fail", 0) + 1
                 continue
+            if (masts[0] is None or masts[-1] is None) and ts[-1] - ts[0] > 9.0:
+                self.why["one_side"] = self.why.get("one_side", 0) + 1
+                continue  # too wide for a cantilever
             masts = [m for m in masts if m is not None]
+            if len(masts) == 1:  # cantilever: beam runs from the single mast across the group
+                far = ts[-1] + 0.6 if masts[0] < ts[0] else ts[0] - 0.6
+                masts_beam = sorted([masts[0], far])
+            else:
+                masts_beam = [masts[0], masts[-1]]
             beam_z = zg + BEAM_H
-            A = P + n * masts[0]; B = P + n * masts[-1]
+            A = P + n * masts_beam[0]; B = P + n * masts_beam[-1]
             beam_fp = LineString([A, B]).buffer(0.3)
-            if self.blocked(beam_fp, beam_z - 0.4, beam_z + 0.6):
+            beam_clear = all(self.clear_of_tracks(*(A + (B - A) * u), beam_z - 0.3, beam_z + 0.45, r=1.95)
+                             for u in np.linspace(0, 1, max(2, int(np.hypot(*(B - A)) / 1.0))))
+            if not beam_clear or self.blocked(beam_fp, beam_z - 0.4, beam_z + 0.6):
+                self.why["beam_blocked"] = self.why.get("beam_blocked", 0) + 1
                 continue
             for m in masts:
                 x, y = P + n * m
@@ -664,22 +744,28 @@ class Model:
         return zg - DECK
 
     def mast_ok(self, x, y, zg, col_pts):
+        why = self.why = getattr(self, "why", {})
+        if not hasattr(self, "_U_in"):
+            self._U_in = self.U.buffer(-0.35)
         if not self.clear_of_tracks(x, y, zg - DECK, zg + BEAM_H, r=2.35):
-            return False
-        if not contains_xy(self.U.buffer(-0.35), x, y):
-            return False  # must stand on the deck / platform, not hang in the air
+            why["track"] = why.get("track", 0) + 1; return False
+        if not contains_xy(self._U_in, x, y):
+            why["no_deck"] = why.get("no_deck", 0) + 1; return False  # must stand on deck / platform
         for c in col_pts:
             if abs(c[0] - x) < 1.2 and abs(c[1] - y) < 1.2:
-                return False
+                why["column"] = why.get("column", 0) + 1; return False
         if self.blocked(Point(x, y).buffer(0.25), zg - DECK + 0.3, zg + BEAM_H, skip=("slab", "platform")):
-            return False
+            why["obstacle"] = why.get("obstacle", 0) + 1; return False
         return True
 
     def blocked(self, fp, z0, z1, skip=()):
-        if not hasattr(self, "_otree") or self._otree_n != len(self.sc.obstacles):
-            self._otree = STRtree([o[0] for o in self.sc.obstacles]); self._otree_n = len(self.sc.obstacles)
-        for c in self._otree.query(fp, predicate="intersects"):
-            poly, a, b, lab = self.sc.obstacles[c]
+        obs = self.sc.obstacles
+        if not hasattr(self, "_otree") or len(obs) - self._otree_n > 300:
+            self._otree = STRtree([o[0] for o in obs]); self._otree_n = len(obs)
+        cand = list(self._otree.query(fp, predicate="intersects"))
+        cand += [i for i in range(self._otree_n, len(obs)) if obs[i][0].intersects(fp)]
+        for c in cand:
+            poly, a, b, lab = obs[c]
             if lab in skip:
                 continue
             if a < z1 and b > z0:
@@ -718,15 +804,16 @@ class Model:
             mk.sweep(sc, "concrete", path, [(width, 0), (width, -2.0), (-width, -2.0), (-width, 0)])
             mk.sweep(sc, "parapet", path, [(width, 0), (width, 1.1), (width - 0.25, 1.1), (width - 0.25, 0)])
             mk.sweep(sc, "parapet", path, [(-width + 0.25, 0), (-width + 0.25, 1.1), (-width, 1.1), (-width, 0)])
-            fp = LineString(p).buffer(width)
-            sc.obstacle(fp, float(z.min()) - 2.0, float(z.max()) + 1.1, "expressway")
+            for k in range(len(p) - 1):
+                fp = LineString(p[k:k + 2]).buffer(width, cap_style="flat")
+                sc.obstacle(fp, float(min(z[k], z[k + 1])) - 2.0, float(max(z[k], z[k + 1])) + 1.1, "expressway")
             s = mk.cumlen(path)
             _, left, _ = mk.frames(path)
             for s0 in np.arange(10, s[-1], 30):
                 k = int(np.searchsorted(s, s0))
                 k = min(k, len(p) - 1)
                 x, y = p[k]
-                if not self.clear_of_tracks(x, y, g[k], z[k], r=3.0) or contains_xy(self.U.buffer(1.0), x, y):
+                if not self.clear_of_tracks(x, y, g[k], z[k] - 2.0, r=3.6) or contains_xy(self.U.buffer(1.0), x, y):
                     continue
                 mk.boxes(sc, "concrete", [[x, y, (z[k] - 2 + g[k]) / 2]], [left[k][1], -left[k][0], 0], left[k], [2.0, 3.0, z[k] - 2 - g[k]])
 
@@ -922,15 +1009,42 @@ class Model:
         return np.c_[xy, z], s
 
     def export(self, out):
-        meshes = {}
+        """Write one .npy triple per material plus scene.json and station-sign PNGs (Blender-version neutral)."""
+        os.makedirs(out, exist_ok=True)
+        mats = []
         for mat, bk in self.sc.buckets.items():
             a = bk.arrays()
-            if a is not None:
-                meshes[mat] = a
+            if a is None:
+                continue
+            v, f, uv = a
+            np.save(os.path.join(out, mat + ".v.npy"), v.astype(np.float32))
+            np.save(os.path.join(out, mat + ".f.npy"), f.astype(np.int32))
+            np.save(os.path.join(out, mat + ".uv.npy"), uv.astype(np.float32))
+            mats.append(mat)
         cam, s = self.camera_path()
         stations = [(n, en, p.tolist()) for n, en, p in self.station_names()]
-        pickle.dump(dict(meshes=meshes, camera=cam, cam_s=s, stations=stations, log=self.log), open(out, "wb"))
+        for n, en, _ in stations:
+            if "sign_" + n in mats:
+                sign_png(os.path.join(out, "sign_%s.png" % n), n, en)
+        json.dump(dict(materials=mats, camera=cam.tolist(), cam_s=s.tolist(), stations=stations, log=self.log),
+                  open(os.path.join(out, "scene.json"), "w"), ensure_ascii=False)
 
+
+def sign_png(path, name, en):
+    from PIL import Image, ImageDraw, ImageFont
+    font = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "RailSimulator", "Source", "UnityProject",
+                        "Assets", "Resources", "UIFont.ttf")
+    im = Image.new("RGB", (1024, 270), (245, 246, 244))
+    d = ImageDraw.Draw(im)
+    d.rectangle([0, 200, 1024, 232], fill=(154, 205, 50))   # Yamanote line colour band
+    try:
+        f1 = ImageFont.truetype(font, 130); f2 = ImageFont.truetype(font, 40)
+        f1.set_variation_by_axes([700]) if hasattr(f1, "set_variation_by_axes") else None
+    except Exception:
+        f1 = f2 = ImageFont.load_default()
+    d.text((512, 95), name, fill=(20, 20, 20), font=f1, anchor="mm")
+    d.text((512, 175), en, fill=(40, 40, 40), font=f2, anchor="mm")
+    im.save(path)
 
 if __name__ == "__main__":
     data, out = sys.argv[1], sys.argv[2]

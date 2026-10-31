@@ -28,7 +28,7 @@ def envelope_polys(p, half):
     return out
 
 
-def check(m, region=None):
+def check(m, region=None, tag="all"):
     obs = m.sc.obstacles
     tree = STRtree([o[0] for o in obs])
     rep = []
@@ -48,7 +48,7 @@ def check(m, region=None):
                             continue
                         viol[lab] = viol.get(lab, 0) + 1
                         examples.setdefault(lab, []).append((tr.name, round(float(poly.centroid.x), 1), round(float(poly.centroid.y), 1), round(za + z0, 1)))
-    rep.append("clearance violations: %d %s" % (sum(viol.values()), viol))
+    rep.append("clearance violations [%s]: %d %s" % (tag, sum(viol.values()), viol))
     for lab, ex in examples.items():
         rep.append("  %s e.g. %s" % (lab, ex[:4]))
     # nothing below ground on the driven line

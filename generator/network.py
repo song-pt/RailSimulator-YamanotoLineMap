@@ -72,7 +72,7 @@ class Network:
         s = np.array([self.main.project(Point(a, b)) for a, b in zip(np.atleast_1d(x), np.atleast_1d(y))])
         return np.interp(s, self.ms, self.base_h)
 
-    def solve_heights(self):
+    def solve_heights(self, level=None):
         idx = {}
         for tr in self.tracks:
             for n in tr.nodes:
@@ -91,7 +91,10 @@ class Network:
                 off, w = 0.0, 1e4
             for n in tr.nodes:
                 i = idx[n]
-                target[i] += w * (base[i] + off); wsum[i] += w
+                wn = w
+                if not tr.main and max(1, layer) == 1 and self.main.distance(Point(xy[i])) < 6.5:
+                    wn = 1e3   # tracks running alongside the main line share its structure level
+                target[i] += wn * (base[i] + off); wsum[i] += wn
             for a, b in zip(tr.nodes[:-1], tr.nodes[1:]):
                 i, j = idx[a], idx[b]
                 d = max(1.0, float(np.hypot(*(xy[i] - xy[j]))))
@@ -101,6 +104,10 @@ class Network:
         # nodes without any trusted anchor follow the base profile weakly
         weak = wsum == 0
         target[weak] = base[weak]; wsum[weak] = 1e-3
+        for n, z in (level or {}).items():  # station levelling: tracks along one platform share a level
+            if n in idx:
+                i = idx[n]
+                target[i] = z * 5e4; wsum[i] = 5e4
         A = Lmat * SMOOTH + sp.diags(wsum)
         h = spla.spsolve(A.tocsc(), target)
         self.node_h = {n: h[i] for n, i in idx.items()}
