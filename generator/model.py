@@ -290,6 +290,17 @@ class Model:
                 continue
             fp = pc["fp"].buffer(0.4)
             z0 = pc["z"] + 7.2
+            hit = set()
+            for c in self.idx.tree.query(fp.buffer(2.0), predicate="intersects"):
+                t2, i = self.idx.meta[c]
+                z2 = float(self.tracks[t2].pts[i:i + 2, 2].max())
+                same_tube = self.tracks[t2].tags.get("tunnel") and abs(z2 - pc["z"]) < 1.0
+                if t2 != pc["ti"] and not same_tube and z2 + 5.8 > z0:
+                    hit.add(t2)
+            if hit:
+                fp = fp.difference(unary_union([self.tracks[t2].line.buffer(2.0) for t2 in hit]))
+            if fp.is_empty or fp.area < 2.0:
+                continue
             g = float(self.dem(*pc["sub"][len(pc["sub"]) // 2][:2]))
             mk.prism(sc, "concrete", "concrete", segmentize(fp, 3.0), max(z0 + 1.0, g), z0, bottom=True)
             sc.obstacle(fp, z0, max(z0 + 1.0, g), "slab")
@@ -596,24 +607,41 @@ class Model:
     def local_obstacles(self, P, zref, dz0, dz1, label):
         """Register a polygon as obstacle cells whose heights follow the local rail level."""
         for c in self.cells(P):
-            z = float(self.idx.nearest_z(np.array([c.representative_point().coords[0]]), zref=zref, r=25.0)[0])
-            self.sc.obstacle(c, z + dz0, z + dz1, label)
+            pts = np.vstack([np.asarray(c.exterior.coords)[:, :2], np.array(c.representative_point().coords)]) if c.geom_type == "Polygon" \
+                else np.array(c.representative_point().coords)
+            z = self.plat_z(pts, zref)
+            self.sc.obstacle(c, float(z.min()) + dz0, float(z.max()) + dz1, label)
 
     def plat_top_at(self, x, y):
         if not self.plat_tree:
             return np.nan
         for c in self.plat_tree.query(Point(x, y), predicate="dwithin", distance=0.5):
-            return float(self.idx.nearest_z(np.array([[x, y]]), r=25.0)[0]) + PLAT_H
+            P, ti = self.platforms[c]
+            return float(self.plat_z(np.array([[x, y]]), self.plat_ref(P, ti))[0]) + PLAT_H
         return np.nan
+
+    def plat_ref(self, P, ti):
+        """Rail level of the platform's own track next to this platform (local, not the whole way's mean)."""
+        tr = self.tracks[ti]
+        sd = mk.cumlen(tr.pts)
+        return float(np.interp(tr.line.project(P.representative_point()), sd, tr.pts[:, 2]))
+
+    def plat_z(self, xy, zref):
+        """Platform reference rail level: the lowest same-level track within 9 m (never above any adjacent rail)."""
+        out = np.empty(len(xy))
+        for k, (x, y) in enumerate(np.asarray(xy)[:, :2]):
+            hits = [h[2] for h in self.idx.near(x, y, 9.0) if abs(h[2] - zref) < 2.5]
+            out[k] = min(hits) if hits else zref
+        return out
 
     def platform_meshes(self):
         sc = self.sc
         lowclear_all = []
         for P, ti in self.platforms:
-            zref = float(np.mean([self.tracks[ti].pts[:, 2].mean()]))
+            zref = self.plat_ref(P, ti)
             Pd = segmentize(P, 2.0)
-            ztop = lambda xy, zr=zref: self.idx.nearest_z(xy, zref=zr, r=25.0) + PLAT_H
-            zslab = lambda xy, zr=zref: self.idx.nearest_z(xy, zref=zr, r=25.0) - DECK - SLAB
+            ztop = lambda xy, zr=zref: self.plat_z(xy, zr) + PLAT_H
+            zslab = lambda xy, zr=zref: self.plat_z(xy, zr) - DECK - SLAB
             mk.prism(sc, "platform", "platform_side", Pd, ztop, zslab, bottom=True)
             self.local_obstacles(P, zref, -DECK - SLAB, PLAT_H, "platform")
             zt = zref
@@ -625,6 +653,7 @@ class Model:
 
     def platform_furniture(self):
         sc = self.sc
+        self.plat_union = unary_union([p for p, _ in self.platforms]) if self.platforms else Polygon()
         cols_all = []
         self.columns = []
         stations = self.station_names()
@@ -640,11 +669,17 @@ class Model:
             nrm3 = np.c_[nrm, np.zeros(len(nrm))]
             sign = np.sign(np.sum(left[:, :2] * nrm, 1))[:, None]
             L = left * sign
-            mk.sweep(sc, "edge_white", ii + [0, 0, 0.004], [(0.0, 0), (0.12, 0)], left=L)
-            mk.sweep(sc, "tactile", ii + [0, 0, 0.006], [(0.80, 0), (1.10, 0)], left=L)
+            on = contains_xy(self.plat_union, *(ii[:, :2] + L[:, :2] * 0.6).T)
+            for run in runs(on):
+                if len(run) < 3:
+                    continue
+                mk.sweep(sc, "edge_white", ii[run] + [0, 0, 0.004], [(0.0, 0), (0.12, 0)], left=L[run])
+                mk.sweep(sc, "tactile", ii[run] + [0, 0, 0.006], [(0.80, 0), (1.10, 0)], left=L[run])
             psd = any(k in tr.name for k in ("山手線", "京浜東北線"))
             if psd and len(ii) > 10:
-                self.psd(ii, L)
+                for run in runs(on):
+                    if len(run) > 10:
+                        self.psd(ii[run], L[run])
             # columns along the platform middle, canopy is built per platform polygon below
             s_m = np.arange(6, len(mids) - 6, 12)
             for k in s_m:
@@ -734,6 +769,30 @@ class Model:
             q, tq, lq = at(m0 + 2.9 + dx, 0.36)
             mk.boxes(sc, "psd_door", q + [0, 0, 0.62], tq, lq, [0.97, 0.06, 1.24])
         for dx in (0.0, 2.9, 4.95):                        # posts
+            q, tq, lq = at(m0 + dx, 0.42)
+            mk.boxes(sc, "psd_frame", q + [0, 0, 0.67], tq, lq, [0.12, 0.2, 1.34])
+        q, tq, lq = at(m0 + 1.45, 0.42)
+        mk.boxes(sc, "psd_frame", q + [0, 0, 1.33], tq, lq, [2.95, 0.16, 0.06])
+        keep = contains_xy(self.plat_union.buffer(-0.05), *at(m0 + 2.5, 0.40)[0][:, :2].T)
+        if not keep.all():   # drop modules that would stand off the final platform surface
+            m0 = m0[keep]
+            if len(m0) == 0:
+                return
+            return self.psd_modules(at, m0)
+        pc, tc, lc = at(m0 + 2.5, 0.40)
+        for c, tq, lq in zip(pc, tc, lc):
+            c4 = [c[:2] + tq[:2] * a * 2.5 + lq[:2] * b * 0.11 for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
+            sc.obstacle(Polygon(c4), c[2], c[2] + 1.4, "psd")
+
+    def psd_modules(self, at, m0):
+        sc = self.sc
+        p, t, l = at(m0 + 1.45, 0.42)
+        mk.boxes(sc, "psd_frame", p + [0, 0, 0.45], t, l, [2.9, 0.12, 0.9])
+        mk.boxes(sc, "psd_glass", p + [0, 0, 1.1], t, l, [2.8, 0.04, 0.4])
+        for dx in (0.5, 1.5):
+            q, tq, lq = at(m0 + 2.9 + dx, 0.36)
+            mk.boxes(sc, "psd_door", q + [0, 0, 0.62], tq, lq, [0.97, 0.06, 1.24])
+        for dx in (0.0, 2.9, 4.95):
             q, tq, lq = at(m0 + dx, 0.42)
             mk.boxes(sc, "psd_frame", q + [0, 0, 0.67], tq, lq, [0.12, 0.2, 1.34])
         q, tq, lq = at(m0 + 1.45, 0.42)
